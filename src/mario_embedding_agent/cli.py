@@ -13,7 +13,7 @@ from .encoder import FrozenEncoder, download_model, prepare_actions
 from .environment import make_env, step, COMMANDS
 from .policy import ActorCritic
 from .ppo import Transition, update
-from .rewards import StageDetector, reward
+from .rewards import StageDetector, GapDetector, reward
 from .display import Display
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,17 +44,22 @@ def main():
         return
     payload = checkpoint.load(args.resume or args.checkpoint) if args.resume or args.command == 'play' else None
     config = {'reward_scale': 1000.0, 'image_tokens': 70, 'seed': args.seed,
-              'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4}
+              'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
+              'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1'}
     if payload:
-        if {k: v for k, v in payload['config'].items() if k != 'seed'} != {k: v for k, v in config.items() if k != 'seed'}:
+        # Old checkpoints retain weights/optimizer; explicitly log objective migration.
+        saved_config = dict(payload['config'])
+        saved_config.setdefault('gap_bonus', 1.0)
+        saved_config.setdefault('gap_detector', 'overworld-rgb-v1')
+        if {k: v for k, v in saved_config.items() if k != 'seed'} != {k: v for k, v in config.items() if k != 'seed'}:
             raise ValueError('Checkpoint training configuration is incompatible')
-        config = payload['config']
+        config = saved_config
     torch.set_num_threads(1)
     torch.manual_seed(config['seed'])
     policy = ActorCritic(embeddings)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=config['learning_rate'])
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
-             'episode_seed': config['seed'], 'episode_commands': []}
+             'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0}
     if payload:
         policy.load_state_dict(payload['policy'])
         optimizer.load_state_dict(payload['optimizer'])
@@ -63,11 +68,16 @@ def main():
     env = make_env()
     frame, _ = env.reset(seed=state['episode_seed'])
     detector = StageDetector()
+    gap_detector = GapDetector()
     detector.observe(frame)
+    gap_detector.observe(frame)
     # Deterministic replay reconstructs the current episode without reading RAM.
     for index in state['episode_commands']:
         frame, died = step(env, COMMANDS[index])
-        detector.observe(frame)
+        if detector.observe(frame):
+            gap_detector = GapDetector()
+        else:
+            gap_detector.observe(frame)
         if died:
             raise ValueError('Saved episode replay unexpectedly terminated')
     display = None if args.headless else Display()
@@ -95,7 +105,7 @@ def main():
         log.flush()
 
     def state_counts():
-        return {k: state[k] for k in ('frames', 'decisions', 'updates', 'deaths', 'clears')}
+        return {k: state[k] for k in ('frames', 'decisions', 'updates', 'deaths', 'clears', 'gaps')}
 
     def finish(raw, done, bootstrap=0.0):
         nonlocal active, last_reward, metrics, save_due
@@ -116,6 +126,7 @@ def main():
         features = encoder.encode_frame(image)
         return features, (time.perf_counter()-before)*1000
 
+    emit('started', gap_bonus=config['gap_bonus'], reward_objective_migrated=bool(payload and 'gap_bonus' not in payload['config']))
     print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
     try:
         while args.total_frames is None or state['frames']-start_frames < args.total_frames:
@@ -142,10 +153,10 @@ def main():
                 with torch.no_grad():
                     bootstrap = float(policy(features)[1])
                 if active is not None:
-                    finish(-1.0, False, bootstrap)
+                    finish(-1.0 + active['gap_bonus'], False, bootstrap)
                 action, log_prob, value, probabilities = policy.act(features, sample=args.command == 'train')
                 active = dict(features=features, action=action, log_prob=log_prob, value=value,
-                              commands=ACTIONS[action].commands(), position=0, observed=observation[1])
+                              commands=ACTIONS[action].commands(), position=0, observed=observation[1], gap_bonus=0.0)
                 policy_frame = observation[2]
                 state['decisions'] += 1
                 emit('decision', action=ACTIONS[action].name, inference_ms=inference_ms,
@@ -159,6 +170,13 @@ def main():
             state['frames'] += 1
             state['episode_commands'].append(COMMANDS.index(command))
             cleared = detector.observe(frame)
+            crossed = gap_detector.observe(frame)
+            if crossed and not died and not cleared and active is not None:
+                active['gap_bonus'] += config['gap_bonus']
+                state['gaps'] += 1
+                image_path = logdir/f'gap-{state["frames"]}.png'
+                Image.fromarray(frame).save(image_path)
+                emit('gap_crossing', bonus=config['gap_bonus'], captured_frame=str(image_path))
             if died or cleared:
                 outcome = 'death' if died else 'clear'
                 image_path = logdir/f'{outcome}-{state["frames"]}.png'
@@ -167,6 +185,7 @@ def main():
                 state['deaths' if died else 'clears'] += 1
                 emit(outcome, raw_reward=last_reward, captured_frame=str(image_path))
                 generation += 1
+                gap_detector = GapDetector()
                 if died:
                     state['episode_seed'] += 1
                     state['episode_commands'] = []
@@ -184,7 +203,7 @@ def main():
                          f'Frame {state["frames"]}', f'Action: {ACTIONS[active["action"]].name if active else "waiting"}',
                          f'Encoder {inference_ms:.1f} ms', f'Input age {state["frames"]-active["observed"] if active else 0} frames',
                          f'Rollout {len(rollout)}/{args.rollout}', f'PPO updates {state["updates"]}',
-                         f'Deaths {state["deaths"]} clears {state["clears"]}', f'Reward {last_reward:g} / {last_reward/1000:g}',
+                         f'Dead {state["deaths"]} clear {state["clears"]} gaps {state["gaps"]}', f'Reward {last_reward:g} / {last_reward/1000:g}',
                          *[f'{k}: {metrics[k]:.4g}' for k in ('policy_loss', 'value_loss', 'entropy', 'explained_variance') if isinstance(metrics.get(k), (float, int))],
                          'Top action probabilities:',
                          *[f'{ACTIONS[i].name}: {probabilities[i]:.2f}' for i in sorted(range(len(probabilities)), key=lambda i: probabilities[i], reverse=True)[:3]],
