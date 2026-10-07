@@ -1,0 +1,29 @@
+[project]
+name = "mario-embedding-agent"
+version = "0.1.0"
+description = "Screenshot-only Mario PPO with frozen EmbeddingGemma-2 and trainable actor/critic"
+readme = "README.md"
+authors = [
+    { name = "Playitcool_", email = "129354153+Playitcooool@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "gym-super-mario-bros>=9.1.0",
+    "gymnasium>=1.4.0",
+    "huggingface-hub>=1.33.0",
+    "numpy>=2.5.3",
+    "pillow>=12.3.0",
+    "pygame>=2.6.1",
+    "sentence-transformers>=6.1.0",
+    "torch>=2.14.1",
+    "torchvision>=0.29.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
