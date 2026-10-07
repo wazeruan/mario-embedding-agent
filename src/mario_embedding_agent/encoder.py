@@ -100,7 +100,7 @@ def prepare_actions(encoder, path=Path('models/action-embeddings.pt')):
     if path.exists():
         payload = torch.load(path, map_location='cpu', weights_only=True)
         if payload.get('metadata') != metadata:
-            raise ValueError('Action embedding cache does not match the encoder/actions. Regenerate it with prepare --force.')
+            raise ValueError('Action embedding cache does not match the encoder/actions. Delete models/action-embeddings.pt and run mario-agent prepare to regenerate it.')
         return FrozenEncoder._validate(payload['embeddings'], len(ACTIONS))
     vectors = encoder.encode_actions().clone()
     path.parent.mkdir(parents=True, exist_ok=True)

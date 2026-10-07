@@ -27,3 +27,6 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
 ]
+
+[project.scripts]
+mario-agent = "mario_embedding_agent.cli:main"
