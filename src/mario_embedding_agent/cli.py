@@ -13,7 +13,7 @@ from .encoder import FrozenEncoder, download_model, prepare_actions
 from .environment import make_env, step, COMMANDS
 from .policy import ActorCritic
 from .ppo import Transition, update
-from .rewards import StageDetector, GapDetector, reward
+from .rewards import StageDetector, GapDetector, RightwardProgress, reward
 from .display import Display
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,12 +45,15 @@ def main():
     payload = checkpoint.load(args.resume or args.checkpoint) if args.resume or args.command == 'play' else None
     config = {'reward_scale': 1000.0, 'image_tokens': 70, 'seed': args.seed,
               'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
-              'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1'}
+              'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
+              'movement_reward': 1.0, 'motion_detector': 'rgb-world-displacement-v1'}
     if payload:
         # Old checkpoints retain weights/optimizer; explicitly log objective migration.
         saved_config = dict(payload['config'])
         saved_config.setdefault('gap_bonus', 1.0)
         saved_config.setdefault('gap_detector', 'overworld-rgb-v1')
+        saved_config.setdefault('movement_reward', 1.0)
+        saved_config.setdefault('motion_detector', 'rgb-world-displacement-v1')
         if {k: v for k, v in saved_config.items() if k != 'seed'} != {k: v for k, v in config.items() if k != 'seed'}:
             raise ValueError('Checkpoint training configuration is incompatible')
         config = saved_config
@@ -69,6 +72,8 @@ def main():
     frame, _ = env.reset(seed=state['episode_seed'])
     detector = StageDetector()
     gap_detector = GapDetector()
+    motion = RightwardProgress()
+    motion.reset(frame)
     detector.observe(frame)
     gap_detector.observe(frame)
     # Deterministic replay reconstructs the current episode without reading RAM.
@@ -76,8 +81,10 @@ def main():
         frame, died = step(env, COMMANDS[index])
         if detector.observe(frame):
             gap_detector = GapDetector()
+            motion.reset(frame)
         else:
             gap_detector.observe(frame)
+        motion.observe(frame)
         if died:
             raise ValueError('Saved episode replay unexpectedly terminated')
     display = None if args.headless else Display()
@@ -126,7 +133,7 @@ def main():
         features = encoder.encode_frame(image)
         return features, (time.perf_counter()-before)*1000
 
-    emit('started', gap_bonus=config['gap_bonus'], reward_objective_migrated=bool(payload and 'gap_bonus' not in payload['config']))
+    emit('started', gap_bonus=config['gap_bonus'], reward_objective_migrated=bool(payload and ('movement_reward' not in payload['config'] or 'gap_bonus' not in payload['config'])))
     print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
     try:
         while args.total_frames is None or state['frames']-start_frames < args.total_frames:
@@ -153,10 +160,10 @@ def main():
                 with torch.no_grad():
                     bootstrap = float(policy(features)[1])
                 if active is not None:
-                    finish(-1.0 + active['gap_bonus'], False, bootstrap)
+                    finish(reward(False, False, active['right_progress'] > 1.0, active['gap_bonus']), False, bootstrap)
                 action, log_prob, value, probabilities = policy.act(features, sample=args.command == 'train')
                 active = dict(features=features, action=action, log_prob=log_prob, value=value,
-                              commands=ACTIONS[action].commands(), position=0, observed=observation[1], gap_bonus=0.0)
+                              commands=ACTIONS[action].commands(), position=0, observed=observation[1], gap_bonus=0.0, right_progress=0.0)
                 policy_frame = observation[2]
                 state['decisions'] += 1
                 emit('decision', action=ACTIONS[action].name, inference_ms=inference_ms,
@@ -169,6 +176,9 @@ def main():
             frame, died = step(env, command)
             state['frames'] += 1
             state['episode_commands'].append(COMMANDS.index(command))
+            right_progress = motion.observe(frame)
+            if right_progress is not None and active is not None:
+                active['right_progress'] += right_progress
             cleared = detector.observe(frame)
             crossed = gap_detector.observe(frame)
             if crossed and not died and not cleared and active is not None:
@@ -186,10 +196,13 @@ def main():
                 emit(outcome, raw_reward=last_reward, captured_frame=str(image_path))
                 generation += 1
                 gap_detector = GapDetector()
+                if cleared:
+                    motion.reset(frame)
                 if died:
                     state['episode_seed'] += 1
                     state['episode_commands'] = []
                     frame, _ = env.reset(seed=state['episode_seed'])
+                    motion.reset(frame)
                     detector = StageDetector()
                     detector.observe(frame)
             if args.command == 'train' and save_due:

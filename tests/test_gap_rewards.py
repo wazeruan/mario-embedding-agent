@@ -85,12 +85,15 @@ def test_real_overworld_gap_crossing_from_controller_replay():
 import pytest
 
 
-@pytest.mark.parametrize(('cross_at', 'death_at', 'expected_rewards', 'expected_gaps'),
-                         [(2, None, [0., -.001], 1),
-                          (6, 8, [-.001, -1.], 1),
-                          (2, 2, [-1., -.001], 0)])
+@pytest.mark.parametrize(('cross_at', 'death_at', 'expected_rewards', 'expected_gaps', 'motion_value'),
+                         [(2, None, [.001, 0.], 1, 0.),
+                          (6, 8, [0., -1.], 1, 0.),
+                          (2, 2, [-1., 0.], 0, 0.),
+                          (2, None, [.002, .001], 1, .6),
+                          (2, None, [.001, 0.], 1, -.6),
+                          (6, 8, [.001, -1.], 1, .6)])
 def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
-        monkeypatch, tmp_path, cross_at, death_at, expected_rewards, expected_gaps):
+        monkeypatch, tmp_path, cross_at, death_at, expected_rewards, expected_gaps, motion_value):
     import copy
     import sys
     import torch
@@ -114,6 +117,12 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
         def observe(self, frame):
             return int(frame[0, 0, 0]) == cross_at
 
+    class Motion:
+        def reset(self, frame):
+            pass
+        def observe(self, frame):
+            return motion_value
+
     env = Env()
     updates, saved = [], []
     def fake_step(env, command):
@@ -129,6 +138,7 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
     monkeypatch.setattr(cli, 'prepare_actions', lambda *args: torch.ones(18, 768))
     monkeypatch.setattr(cli, 'make_env', lambda: env)
     monkeypatch.setattr(cli, 'GapDetector', Detector)
+    monkeypatch.setattr(cli, 'RightwardProgress', Motion)
     monkeypatch.setattr(cli, 'step', fake_step)
     monkeypatch.setattr(cli, 'update', fake_update)
     monkeypatch.setattr(cli.ActorCritic, 'act', lambda *args, **kwargs: (0, 0., 0., [1.] + [0.] * 17))

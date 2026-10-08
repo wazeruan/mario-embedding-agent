@@ -31,8 +31,9 @@ class StageDetector:
         return False
 
 
-def reward(death, cleared):
-    return -1000.0 if death else 1.0 if cleared else -1.0
+def reward(death, cleared, moved_right=False, gap_bonus=0.0):
+    """Raw reward: terminal outcomes override movement and shaping rewards."""
+    return -1000.0 if death else 1.0 if cleared else float(bool(moved_right)) + float(gap_bonus)
 
 
 class GapDetector:
@@ -110,3 +111,65 @@ class GapDetector:
             self.completed = True
             return True
         return False
+
+
+class RightwardProgress:
+    """Estimate Mario world displacement from RGB sprite and scrolling scenery.
+
+    Mario screen motion plus leftward scenery scroll approximates world motion.
+    Ambiguous sprite/scene matches contribute no estimate.
+    """
+    def __init__(self):
+        self.previous = None
+        self.last_x = None
+        self.unobserved_scroll = 0.0
+
+    def reset(self, frame):
+        self.previous = np.array(frame, copy=True)
+        mario = GapDetector.mario(frame)
+        self.last_x = None if mario is None else mario[0]
+        self.unobserved_scroll = 0.0
+
+    @staticmethod
+    def _scene_scroll(previous, current):
+        # Compare the textured ground strip; positive d means ground moved left.
+        a, b = previous[208:240], current[208:240]
+        scores = []
+        for d in range(-8, 9):
+            if d >= 0:
+                old, new = a[:, d:], b[:, :256-d]
+            else:
+                old, new = a[:, :256+d], b[:, -d:]
+            error = float(np.abs(old.astype(np.int16)-new.astype(np.int16)).mean())
+            scores.append((error, d))
+        scores.sort()
+        zero_error = next(error for error, shift in scores if shift == 0)
+        best_error, shift = scores[0]
+        if shift == 0 or best_error + 1.0 >= zero_error or scores[1][0] - best_error < 0.1:
+            return 0.0
+        return float(shift)
+
+    def observe(self, frame):
+        if frame.shape != (240, 256, 3):
+            return None
+        if self.previous is None:
+            self.reset(frame)
+            return None
+        scroll = self._scene_scroll(self.previous, frame)
+        self.unobserved_scroll += scroll
+        self.previous = np.array(frame, copy=True)
+        mario = GapDetector.mario(frame)
+        if mario is None:
+            # Drop an incomplete interval to avoid assigning stale motion later.
+            self.last_x = None
+            self.unobserved_scroll = 0.0
+            return None
+        x = mario[0]
+        if self.last_x is None:
+            self.last_x = x
+            self.unobserved_scroll = 0.0
+            return None
+        progress = x - self.last_x + self.unobserved_scroll
+        self.last_x = x
+        self.unobserved_scroll = 0.0
+        return float(progress)
