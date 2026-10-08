@@ -16,6 +16,7 @@ from .policy import ActorCritic
 from .ppo import Transition, update
 from .rewards import StageDetector, GapDetector, RightwardProgress, ProgressFrontier, reward
 from .display import Display
+from .recovery import PipeExitRecovery
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -111,7 +112,7 @@ def main():
               'recovery_actions': ['down', 'run_left', 'run_right_jump_long', 'right_jump_short'],
               'recovery_logit_bias': 8.0, 'recovery_down_hold_frames': 24,
               'recovery_progress_px': 8.0, 'recovery_progress_window': 4,
-              'recovery_progress_events_required': 2, 'recovery_window_net_progress_px': 8.0}
+              'recovery_progress_events_required': 2, 'recovery_window_net_progress_px': 8.0, 'pipe_recovery': 'rgb-side-entry-v1'}
     config['encoder_backend'] = 'student' if args.student_encoder else 'embeddinggemma2'
     config['student_fingerprint'] = encoder.fingerprint if args.student_encoder else None
     reward_objective_migrated = False
@@ -141,6 +142,8 @@ def main():
             'stagnation_deadband_px', 'recovery_actions', 'recovery_logit_bias',
             'recovery_down_hold_frames', 'recovery_progress_px', 'recovery_progress_window',
             'recovery_progress_events_required', 'recovery_window_net_progress_px')})
+        recovery_behavior_migrated |= saved_config.get('pipe_recovery') != config['pipe_recovery']
+        saved_config['pipe_recovery'] = config['pipe_recovery']
         saved_config.setdefault('gap_bonus', 1.0)
         saved_config.setdefault('gap_detector', 'overworld-rgb-v1')
         reward_objective_migrated = old_reward_version != config['reward_version']
@@ -390,9 +393,10 @@ def main():
                     frontier.claim()
                 recovery_action = None
                 action_bias = None
+                pipe_plan = PipeExitRecovery().choose(observation[2]) if state['recovery_active'] else None
                 if state['recovery_active']:
                     index = state['recovery_action_index']
-                    recovery_action = config['recovery_actions'][index]
+                    recovery_action = pipe_plan[0] if pipe_plan else config['recovery_actions'][index]
                     action_bias = torch.zeros(len(ACTIONS))
                     recovery_index = next(i for i, item in enumerate(ACTIONS) if item.name == recovery_action)
                     action_bias[recovery_index] = config['recovery_logit_bias']
@@ -401,6 +405,9 @@ def main():
                     features, sample=args.command == 'train', action_bias=action_bias,
                     previous_features=previous_features)
                 commands = ACTIONS[action].commands()
+                if pipe_plan and ACTIONS[action].name == pipe_plan[0]:
+                    commands = ACTIONS[action].commands()[:1]*pipe_plan[1]
+                    recovery_action = pipe_plan[2]
                 if recovery_action == 'down' and ACTIONS[action].name == 'down':
                     commands = (('down',),)*config['recovery_down_hold_frames']
                 active = dict(features=features, previous_features=previous_features,
@@ -517,7 +524,7 @@ def main():
                          f'Updates {state["updates"]} KL {metrics.get("final_kl", 0):.3g}',
                          f'Dead {state["deaths"]} clear {state["clears"]} gaps {state["gaps"]}', f'Reward {last_reward:g} / {last_reward/config["reward_scale"]:g}',
                          *[f'{k}: {metrics[k]:.4g}' for k in ('policy_loss', 'value_loss', 'entropy', 'explained_variance') if isinstance(metrics.get(k), (float, int))],
-                         'Top action probabilities:',
+                         'Recovery probabilities:' if active and active['recovery_action'] else 'Policy probabilities:',
                          *[f'{ACTIONS[i].name}: {probabilities[i]:.2f}' for i in sorted(range(len(probabilities)), key=lambda i: probabilities[i], reverse=True)[:3]],
                          'Below: policy input frame']
                 if not display.draw(frame, policy_frame, lines):

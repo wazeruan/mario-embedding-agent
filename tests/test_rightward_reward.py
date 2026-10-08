@@ -148,7 +148,7 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
                           recovery_actions=['down', 'run_left', 'run_right_jump_long', 'right_jump_short'],
                           recovery_logit_bias=8., recovery_down_hold_frames=24,
                           recovery_progress_px=8., recovery_progress_window=4,
-                          recovery_progress_events_required=2, recovery_window_net_progress_px=8.)
+                          recovery_progress_events_required=2, recovery_window_net_progress_px=8., pipe_recovery='rgb-side-entry-v1')
     legacy_policy = {name: value for name, value in old_policy.state_dict().items()
                      if not name.startswith(('temporal_actor.', 'temporal_critic.'))}
     payload = {'config': old_config, 'policy': legacy_policy,
@@ -222,6 +222,7 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     assert config['recovery_progress_window'] == 4
     assert config['recovery_progress_events_required'] == 2
     assert config['recovery_window_net_progress_px'] == 8.
+    assert config['pipe_recovery'] == 'rgb-side-entry-v1'
     assert 'movement_reward' not in config and 'motion_detector' not in config
     assert state['frames'] == 101 and state['updates'] == 5 and state['deaths'] == 2
     assert state['episode_seed'] == 9
