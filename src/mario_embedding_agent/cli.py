@@ -100,7 +100,9 @@ def main():
               'temporal_context': 'previous-embedding-delta-v1',
               'stagnation_threshold': 4, 'stagnation_deadband_px': 1.0,
               'recovery_actions': ['down', 'run_left', 'run_right_jump_long', 'right_jump_short'],
-              'recovery_logit_bias': 8.0}
+              'recovery_logit_bias': 8.0, 'recovery_down_hold_frames': 24,
+              'recovery_progress_px': 8.0, 'recovery_progress_window': 4,
+              'recovery_progress_events_required': 2, 'recovery_window_net_progress_px': 8.0}
     reward_objective_migrated = False
     policy_behavior_migrated = False
     recovery_behavior_migrated = False
@@ -113,14 +115,18 @@ def main():
         old_entropy_coef = saved_config.get('entropy_coef')
         old_temporal_context = saved_config.get('temporal_context')
         recovery_keys = ('stagnation_threshold', 'stagnation_deadband_px',
-                         'recovery_actions', 'recovery_logit_bias')
+                         'recovery_actions', 'recovery_logit_bias', 'recovery_down_hold_frames',
+                         'recovery_progress_px', 'recovery_progress_window',
+                         'recovery_progress_events_required', 'recovery_window_net_progress_px')
         recovery_behavior_migrated = any(saved_config.get(key) != config[key] for key in recovery_keys)
         for key in ('movement_reward', 'motion_detector'):
             saved_config.pop(key, None)
         saved_config.update({key: config[key] for key in (
             'reward_scale', 'death_penalty', 'pixels_per_reward', 'progress_clip', 'reward_version',
             'left_action_logit_bias', 'entropy_coef', 'temporal_context', 'stagnation_threshold',
-            'stagnation_deadband_px', 'recovery_actions', 'recovery_logit_bias')})
+            'stagnation_deadband_px', 'recovery_actions', 'recovery_logit_bias',
+            'recovery_down_hold_frames', 'recovery_progress_px', 'recovery_progress_window',
+            'recovery_progress_events_required', 'recovery_window_net_progress_px')})
         saved_config.setdefault('gap_bonus', 1.0)
         saved_config.setdefault('gap_detector', 'overworld-rgb-v1')
         reward_objective_migrated = old_reward_version != config['reward_version']
@@ -136,7 +142,8 @@ def main():
     optimizer = torch.optim.AdamW(policy.parameters(), lr=config['learning_rate'])
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
              'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0,
-             'stagnant_decisions': 0, 'previous_features': None}
+             'stagnant_decisions': 0, 'recovery_active': False, 'recovery_action_index': 0,
+             'recovery_progress_window': [], 'previous_features': None}
     if args.command == 'evaluate':
         state['episode_seed'] = args.seed
     if payload:
@@ -149,7 +156,13 @@ def main():
             load_optimizer_state(optimizer, payload['optimizer'], policy)
             if args.command == 'train' and reward_objective_migrated:
                 reset_critic_value_scale(policy, optimizer)
+            legacy_recovery_state = 'recovery_active' not in payload['training_state']
             state.update({k: v for k, v in payload['training_state'].items() if k != 'torch_rng_state'})
+            if legacy_recovery_state and state['stagnant_decisions'] >= config['stagnation_threshold']:
+                state['recovery_active'] = True
+                state['recovery_action_index'] = (
+                    (state['stagnant_decisions']-config['stagnation_threshold']) %
+                    len(config['recovery_actions']))
             torch.set_rng_state(payload['training_state']['torch_rng_state'])
     env = make_env()
     frame, _ = env.reset(seed=state['episode_seed'])
@@ -203,13 +216,20 @@ def main():
 
     def state_counts():
         return {k: state[k] for k in ('frames', 'decisions', 'updates', 'deaths', 'clears', 'gaps',
-                                      'stagnant_decisions')}
+                                      'stagnant_decisions', 'recovery_active', 'recovery_action_index',
+                                      'recovery_progress_window')}
+
+    def reset_recovery():
+        state['stagnant_decisions'] = 0
+        state['recovery_active'] = False
+        state['recovery_action_index'] = 0
+        state['recovery_progress_window'] = []
 
     def finish(raw, done, bootstrap=0.0, outcome='step'):
         nonlocal active, last_reward, metrics, save_due
         last_reward = raw
         if outcome in ('death', 'level_clear'):
-            state['stagnant_decisions'] = 0
+            reset_recovery()
         if args.command == 'evaluate':
             # Count terminal rewards even if the death/transition lands while
             # the controller has no active policy decision to credit.
@@ -217,15 +237,40 @@ def main():
             if active is not None:
                 evaluation['episode_progress_px'] += active['right_progress']
         if active is not None:
-            if outcome not in ('death', 'level_clear') and (
-                  active['right_progress'] <= config['stagnation_deadband_px'] and
-                  active['gap_bonus'] <= 0):
-                state['stagnant_decisions'] += 1
-            elif outcome not in ('death', 'level_clear'):
-                state['stagnant_decisions'] = 0
+            recovery_evidence_events = 0
+            recovery_window_net_progress = 0.0
+            if outcome not in ('death', 'level_clear'):
+                if state['recovery_active']:
+                    window = state['recovery_progress_window']
+                    window.append(active['right_progress'])
+                    del window[:-config['recovery_progress_window']]
+                    positive_events = sum(value >= config['recovery_progress_px'] for value in window)
+                    net_progress = sum(window)
+                    recovery_evidence_events = positive_events
+                    recovery_window_net_progress = net_progress
+                    escaped = (active['gap_bonus'] > 0 or
+                               (len(window) >= config['recovery_progress_window'] and
+                                positive_events >= config['recovery_progress_events_required'] and
+                                net_progress >= config['recovery_window_net_progress_px']))
+                    if escaped:
+                        reset_recovery()
+                    else:
+                        state['recovery_action_index'] = (
+                            (state['recovery_action_index']+1) % len(config['recovery_actions']))
+                elif (active['right_progress'] <= config['stagnation_deadband_px'] and
+                      active['gap_bonus'] <= 0):
+                    state['stagnant_decisions'] += 1
+                    if state['stagnant_decisions'] >= config['stagnation_threshold']:
+                        state['recovery_active'] = True
+                        state['recovery_action_index'] = 0
+                        state['recovery_progress_window'] = []
+                else:
+                    reset_recovery()
             emit('decision_result', decision=state['decisions'], action=ACTIONS[active['action']].name,
                  duration_frames=max(0, state['frames']-active['observed']),
                  displacement_px=round(active['right_progress'], 3), gap_bonus=active['gap_bonus'],
+                 recovery_evidence_events=recovery_evidence_events,
+                 recovery_window_net_progress_px=round(recovery_window_net_progress, 3),
                  raw_reward=raw, scaled_reward=raw/config['reward_scale'], outcome=outcome,
                  recovery_action=active['recovery_action'], stagnant_decisions=state['stagnant_decisions'])
             if args.command == 'train':
@@ -253,7 +298,12 @@ def main():
          temporal_context=config['temporal_context'], temporal_context_migrated=temporal_context_migrated,
          left_action_logit_bias=config['left_action_logit_bias'], entropy_coef=config['entropy_coef'],
          stagnation_threshold=config['stagnation_threshold'], recovery_actions=config['recovery_actions'],
-         recovery_logit_bias=config['recovery_logit_bias'])
+         recovery_logit_bias=config['recovery_logit_bias'],
+         recovery_down_hold_frames=config['recovery_down_hold_frames'],
+         recovery_progress_px=config['recovery_progress_px'],
+         recovery_progress_window=config['recovery_progress_window'],
+         recovery_progress_events_required=config['recovery_progress_events_required'],
+         recovery_window_net_progress_px=config['recovery_window_net_progress_px'])
     print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; temporal=embedding delta; '
           f'PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
     try:
@@ -288,9 +338,8 @@ def main():
                                   progress_clip=config['progress_clip']), False, bootstrap)
                 recovery_action = None
                 action_bias = None
-                if state['stagnant_decisions'] >= config['stagnation_threshold']:
-                    index = ((state['stagnant_decisions']-config['stagnation_threshold']) %
-                             len(config['recovery_actions']))
+                if state['recovery_active']:
+                    index = state['recovery_action_index']
                     recovery_action = config['recovery_actions'][index]
                     action_bias = torch.zeros(len(ACTIONS))
                     recovery_index = next(i for i, item in enumerate(ACTIONS) if item.name == recovery_action)
@@ -299,9 +348,12 @@ def main():
                 action, log_prob, value, probabilities = policy.act(
                     features, sample=args.command == 'train', action_bias=action_bias,
                     previous_features=previous_features)
+                commands = ACTIONS[action].commands()
+                if recovery_action == 'down' and ACTIONS[action].name == 'down':
+                    commands = (('down',),)*config['recovery_down_hold_frames']
                 active = dict(features=features, previous_features=previous_features,
                               action=action, log_prob=log_prob, value=value,
-                              commands=ACTIONS[action].commands(), position=0, observed=observation[1], gap_bonus=0.0,
+                              commands=commands, position=0, observed=observation[1], gap_bonus=0.0,
                               right_progress=0.0, recovery_action=recovery_action, action_bias=action_bias)
                 state['previous_features'] = features.detach().clone()
                 policy_frame = observation[2]
@@ -392,11 +444,18 @@ def main():
             dps = (state['decisions']-start_decisions)/elapsed
             if display:
                 recovery = active['recovery_action'] if active and active['recovery_action'] else 'off'
+                recovery = {'run_right_jump_long': 'R+JUMP-LONG',
+                            'right_jump_short': 'R+JUMP-SHORT',
+                            'run_left': 'RUN-LEFT'}.get(recovery, recovery.upper())
+                recovery_evidence = sum(value >= config['recovery_progress_px']
+                                        for value in state['recovery_progress_window'])
+                recovery_net = sum(state['recovery_progress_window'])
                 lines = [f'{args.command} / {args.mode}', f'FPS {fps:.1f}  decisions/s {dps:.2f}',
                          f'Frame {state["frames"]}', f'Action: {ACTIONS[active["action"]].name if active else "waiting"}',
                          'Temporal: prior/current embedding delta',
                          f'Encoder {inference_ms:.1f} ms', f'Input age {state["frames"]-active["observed"] if active else 0} frames',
-                         f'Stagnant decisions {state["stagnant_decisions"]}  recovery {recovery}',
+                         f'Stagnant decisions {state["stagnant_decisions"]}',
+                         f'Recovery {recovery}  {recovery_evidence}/{config["recovery_progress_events_required"]}  {recovery_net:+.0f}px',
                          f'Rollout {len(rollout)}/{args.rollout}', f'PPO updates {state["updates"]}',
                          f'Dead {state["deaths"]} clear {state["clears"]} gaps {state["gaps"]}', f'Reward {last_reward:g} / {last_reward/config["reward_scale"]:g}',
                          *[f'{k}: {metrics[k]:.4g}' for k in ('policy_loss', 'value_loss', 'entropy', 'explained_variance') if isinstance(metrics.get(k), (float, int))],

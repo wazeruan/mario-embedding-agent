@@ -145,7 +145,9 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     if current_recovery_config:
         old_config.update(stagnation_threshold=4, stagnation_deadband_px=1.,
                           recovery_actions=['down', 'run_left', 'run_right_jump_long', 'right_jump_short'],
-                          recovery_logit_bias=8.)
+                          recovery_logit_bias=8., recovery_down_hold_frames=24,
+                          recovery_progress_px=8., recovery_progress_window=4,
+                          recovery_progress_events_required=2, recovery_window_net_progress_px=8.)
     legacy_policy = {name: value for name, value in old_policy.state_dict().items()
                      if not name.startswith(('temporal_actor.', 'temporal_critic.'))}
     payload = {'config': old_config, 'policy': legacy_policy,
@@ -196,10 +198,18 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     assert config['stagnation_deadband_px'] == 1.
     assert config['recovery_logit_bias'] == 8.
     assert config['recovery_actions'] == ['down', 'run_left', 'run_right_jump_long', 'right_jump_short']
+    assert config['recovery_down_hold_frames'] == 24
+    assert config['recovery_progress_px'] == 8.
+    assert config['recovery_progress_window'] == 4
+    assert config['recovery_progress_events_required'] == 2
+    assert config['recovery_window_net_progress_px'] == 8.
     assert 'movement_reward' not in config and 'motion_detector' not in config
     assert state['frames'] == 101 and state['updates'] == 5 and state['deaths'] == 2
     assert state['episode_seed'] == 9
     assert state['stagnant_decisions'] == 3
+    assert state['recovery_active'] is False
+    assert state['recovery_action_index'] == 0
+    assert state['recovery_progress_window'] == []
     assert torch.equal(weights['actor.bias'], payload['policy']['actor.bias'])
     assert torch.count_nonzero(weights['temporal_actor.weight']) == 0
     assert torch.count_nonzero(weights['temporal_critic.3.weight']) == 0
