@@ -95,7 +95,8 @@ def test_death_on_ppo_boundary_autosaves_reset_episode(monkeypatch, tmp_path):
     def fake_step(env, command):
         env.frames += 1
         return np.zeros((240, 256, 3), dtype=np.uint8), env.frames == 8
-    def fake_update(policy, optimizer, rollout, bootstrap):
+    def fake_update(policy, optimizer, rollout, bootstrap, *, entropy_coef):
+        assert entropy_coef == .001
         updates.append(copy.deepcopy(rollout))
         return {}
     monkeypatch.setattr(cli, 'ROOT', tmp_path)

@@ -47,25 +47,32 @@ def main():
               'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
               'death_penalty': 10.0, 'pixels_per_reward': 8.0,
-              'progress_clip': 5.0, 'reward_version': 'signed-progress-v1'}
+              'progress_clip': 5.0, 'reward_version': 'signed-progress-v1',
+              'left_action_logit_bias': -3.0, 'entropy_coef': 0.001}
     reward_objective_migrated = False
+    policy_behavior_migrated = False
     if payload:
         # Preserve learned weights and optimizer while replacing old reward settings.
         saved_config = dict(payload['config'])
         old_reward_version = saved_config.get('reward_version')
+        old_left_bias = saved_config.get('left_action_logit_bias')
+        old_entropy_coef = saved_config.get('entropy_coef')
         for key in ('movement_reward', 'motion_detector'):
             saved_config.pop(key, None)
         saved_config.update({key: config[key] for key in (
-            'reward_scale', 'death_penalty', 'pixels_per_reward', 'progress_clip', 'reward_version')})
+            'reward_scale', 'death_penalty', 'pixels_per_reward', 'progress_clip', 'reward_version',
+            'left_action_logit_bias', 'entropy_coef')})
         saved_config.setdefault('gap_bonus', 1.0)
         saved_config.setdefault('gap_detector', 'overworld-rgb-v1')
         reward_objective_migrated = old_reward_version != config['reward_version']
+        policy_behavior_migrated = (old_left_bias != config['left_action_logit_bias'] or
+                                    old_entropy_coef != config['entropy_coef'])
         if {k: v for k, v in saved_config.items() if k != 'seed'} != {k: v for k, v in config.items() if k != 'seed'}:
             raise ValueError('Checkpoint training configuration is incompatible')
         config = saved_config
     torch.set_num_threads(1)
     torch.manual_seed(config['seed'])
-    policy = ActorCritic(embeddings)
+    policy = ActorCritic(embeddings, left_action_logit_bias=config['left_action_logit_bias'])
     optimizer = torch.optim.AdamW(policy.parameters(), lr=config['learning_rate'])
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
              'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0}
@@ -128,7 +135,8 @@ def main():
                                       active['value'], raw/config['reward_scale'], done))
         active = None
         if len(rollout) >= args.rollout:
-            metrics = update(policy, optimizer, rollout, bootstrap)
+            metrics = update(policy, optimizer, rollout, bootstrap,
+                             entropy_coef=config['entropy_coef'])
             rollout.clear()
             state['updates'] += 1
             save_due = True
@@ -139,7 +147,9 @@ def main():
         features = encoder.encode_frame(image)
         return features, (time.perf_counter()-before)*1000
 
-    emit('started', gap_bonus=config['gap_bonus'], reward_objective_migrated=reward_objective_migrated)
+    emit('started', gap_bonus=config['gap_bonus'], reward_objective_migrated=reward_objective_migrated,
+         policy_behavior_migrated=policy_behavior_migrated,
+         left_action_logit_bias=config['left_action_logit_bias'], entropy_coef=config['entropy_coef'])
     print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
     try:
         while args.total_frames is None or state['frames']-start_frames < args.total_frames:

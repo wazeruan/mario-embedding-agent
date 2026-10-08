@@ -130,7 +130,8 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
         frame = np.zeros((240, 256, 3), dtype=np.uint8)
         frame[0, 0, 0] = env.frames
         return frame, env.frames == death_at
-    def fake_update(policy, optimizer, transitions, bootstrap):
+    def fake_update(policy, optimizer, transitions, bootstrap, *, entropy_coef):
+        assert entropy_coef == .001
         updates.append(copy.deepcopy(transitions))
         return {}
     monkeypatch.setattr(cli, 'ROOT', tmp_path)

@@ -4,10 +4,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.distributions import Categorical
+from .actions import ACTIONS
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, action_embeddings, temperature=0.2):
+    def __init__(self, action_embeddings, temperature=0.2, left_action_logit_bias=-3.0):
         super().__init__()
         vectors = torch.as_tensor(action_embeddings, dtype=torch.float32).detach().clone()
         if vectors.ndim != 2 or vectors.shape[1] != 768 or not torch.isfinite(vectors).all() or (vectors.norm(dim=1) == 0).any():
@@ -17,6 +18,15 @@ class ActorCritic(nn.Module):
         vectors = F.normalize(vectors, dim=1)
         self.register_buffer('action_embeddings', vectors.clone())
         self.temperature = temperature
+        if not math.isfinite(left_action_logit_bias):
+            raise ValueError('Left-action logit bias must be finite.')
+        self.left_action_logit_bias = float(left_action_logit_bias)
+        self.register_buffer(
+            'left_action_mask',
+            torch.tensor([any(button == 'left' for button in action.buttons) for action in ACTIONS],
+                         dtype=torch.float32),
+            persistent=False,
+        )
         self.actor = nn.Linear(768, len(vectors))
         with torch.no_grad():
             self.actor.weight.copy_(vectors / temperature)
@@ -28,7 +38,8 @@ class ActorCritic(nn.Module):
 
     def forward(self, features):
         features = F.normalize(features.to(torch.float32), dim=-1)
-        return self.actor(features), self.critic(features).squeeze(-1)
+        logits = self.actor(features) + self.left_action_logit_bias * self.left_action_mask
+        return logits, self.critic(features).squeeze(-1)
 
     @torch.no_grad()
     def act(self, features, sample=True):

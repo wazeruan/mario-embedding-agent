@@ -174,6 +174,8 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     assert config['progress_clip'] == 5.
     assert config['reward_version'] == 'signed-progress-v1'
     assert config['gap_bonus'] == 1.
+    assert config['left_action_logit_bias'] == -3.
+    assert config['entropy_coef'] == .001
     assert 'movement_reward' not in config and 'motion_detector' not in config
     assert state['frames'] == 101 and state['updates'] == 5 and state['deaths'] == 2
     assert state['episode_seed'] == 9
@@ -182,3 +184,4 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     events = [json.loads(line) for line in (tmp_path/'runs/train.jsonl').read_text().splitlines()]
     assert events[0]['event'] == 'started'
     assert events[0]['reward_objective_migrated'] is True
+    assert events[0]['policy_behavior_migrated'] is True

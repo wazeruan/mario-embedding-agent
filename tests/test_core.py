@@ -41,7 +41,7 @@ def test_actor_initializes_cosine_logits_but_learns_independently():
     original.zero_()
     features = torch.randn(3, 768)
     logits, values = policy(features)
-    torch.testing.assert_close(logits, F.normalize(features, dim=1) @ expected.T / .2)
+    torch.testing.assert_close(logits, F.normalize(features, dim=1) @ expected.T / .2 - 3 * policy.left_action_mask)
     assert values.shape == (3,)
     assert not policy.action_embeddings.requires_grad
     assert policy.actor.weight.data_ptr() != policy.action_embeddings.data_ptr()
@@ -155,3 +155,43 @@ def test_preencoded_action_cache_reused_and_metadata_checked(encoder, tmp_path):
     torch.save(payload, path)
     with pytest.raises(ValueError, match='cache'):
         prepare_actions(encoder, path)
+
+
+def test_uniform_actor_bias_downweights_every_left_action_without_masking():
+    policy = ActorCritic(torch.ones(len(ACTIONS), 768))
+    feature = torch.ones(768)
+    logits, _ = policy(feature)
+    left = torch.tensor(['left' in action.buttons for action in ACTIONS])
+    assert left.sum() == 6
+    torch.testing.assert_close(logits[left], torch.full((6,), 2.))
+    torch.testing.assert_close(logits[~left], torch.full((12,), 5.))
+    _, _, _, probabilities = policy.act(feature)
+    probs = torch.tensor(probabilities)
+    assert 0. < float(probs[left].sum()) < .025
+    torch.testing.assert_close(probs[left][0]/probs[~left][0], torch.tensor(math.exp(-3)))
+    torch.manual_seed(789)
+    chosen = [policy.act(feature)[0] for _ in range(500)]
+    assert any(left[index] for index in chosen)
+    assert 'left_action_mask' not in policy.state_dict()  # Old checkpoints load strictly.
+
+
+def test_ppo_logprobs_and_entropy_use_same_left_bias_as_sampling():
+    policy = ActorCritic(torch.ones(len(ACTIONS), 768))
+    optimizer = torch.optim.Adam(policy.parameters(), lr=0.)
+    feature = torch.ones(768)
+    torch.manual_seed(88)
+    rollout = []
+    for i in range(8):
+        action, log_prob, value, probabilities = policy.act(feature)
+        rollout.append(Transition(feature, action, log_prob, value, .1, i == 7))
+    distribution = torch.distributions.Categorical(probs=torch.tensor(probabilities))
+    metrics = update(policy, optimizer, rollout, 0., epochs=1, minibatch_size=8, entropy_coef=.001)
+    assert metrics['approx_kl'] == pytest.approx(0., abs=1e-7)
+    assert metrics['entropy'] == pytest.approx(float(distribution.entropy()), abs=1e-6)
+    assert metrics['clip_fraction'] == 0.
+
+
+@pytest.mark.parametrize('bias', [float('nan'), float('inf'), -float('inf')])
+def test_left_action_bias_requires_finite_value(bias):
+    with pytest.raises(ValueError, match='finite'):
+        ActorCritic(vectors(), left_action_logit_bias=bias)
