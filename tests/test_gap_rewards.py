@@ -89,10 +89,10 @@ import pytest
                          [(2, None, [.02, 0.], 1, 0.),
                           (6, 8, [0., -1.], 1, 0.),
                           (2, 2, [-1., 0.], 0, 0.),
-                          (2, None, [.026, .006], 1, .6),
-                          (2, None, [.014, -.006], 1, -.6),
-                          (6, 8, [.006, -1.], 1, .6),
-                          (6, 'clear', [.006, .02], 1, .6)])
+                          (2, None, [.0215, .0015], 1, .6),
+                          (2, None, [.02, 0.], 1, -.6),
+                          (6, 8, [.0015, -1.], 1, .6),
+                          (6, 'clear', [.0015, 1.], 1, .6)])
 def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
         monkeypatch, tmp_path, cross_at, death_at, expected_rewards, expected_gaps, motion_value):
     import copy
@@ -136,8 +136,9 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
         frame = np.zeros((240, 256, 3), dtype=np.uint8)
         frame[0, 0, 0] = env.frames
         return frame, env.frames == death_at
-    def fake_update(policy, optimizer, transitions, bootstrap, *, entropy_coef):
+    def fake_update(policy, optimizer, transitions, bootstrap, *, entropy_coef, **kwargs):
         assert entropy_coef == .001
+        assert kwargs == dict(epochs=4, minibatch_size=16, target_kl=.02, reference_frames=20)
         updates.append(copy.deepcopy(transitions))
         return {}
     monkeypatch.setattr(cli, 'ROOT', tmp_path)
@@ -165,8 +166,8 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
     assert all(event['raw_reward']/50 == pytest.approx(event['scaled_reward']) for event in results)
     if death_at == 'clear':
         clear_events = [event for event in results if event['outcome'] == 'level_clear']
-        assert len(clear_events) == 1 and clear_events[0]['raw_reward'] == 1.
-        assert any(item.done and item.reward == .02 for item in updates[0])
+        assert len(clear_events) == 1 and clear_events[0]['raw_reward'] == 50.
+        assert any(item.done and item.reward == 1. for item in updates[0])
     elif death_at is not None:
         death_events = [event for event in results if event['outcome'] == 'death']
         assert len(death_events) == 1 and death_events[0]['raw_reward'] == -50.

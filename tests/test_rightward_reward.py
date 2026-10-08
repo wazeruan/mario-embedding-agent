@@ -117,7 +117,8 @@ def test_real_vertical_jump_without_horizontal_input_does_not_earn_rightward_mot
 
 @pytest.mark.parametrize('legacy_gap_config', [False, True])
 @pytest.mark.parametrize('current_recovery_config', [False, True])
-def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monkeypatch, tmp_path, legacy_gap_config, current_recovery_config):
+@pytest.mark.parametrize('legacy_visual_replay', [False, True])
+def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monkeypatch, tmp_path, legacy_gap_config, current_recovery_config, legacy_visual_replay):
     import copy
     import json
     import sys
@@ -170,6 +171,16 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
         def close(self):
             pass
 
+    if legacy_visual_replay:
+        payload['training_state']['episode_commands'] = [cli.COMMANDS.index(('right',))]*3
+        sequence = iter([10., -5., 5., 2.])
+        class ReplayMotion:
+            def reset(self, frame):
+                pass
+            def observe(self, frame):
+                return next(sequence)
+        monkeypatch.setattr(cli, 'RightwardProgress', ReplayMotion)
+
     saved = []
     def save(path, policy, optimizer, config, state):
         saved.append((copy.deepcopy(config), copy.deepcopy(state),
@@ -188,9 +199,15 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     config, state, weights, optimizer = saved[-1]
     assert config['reward_scale'] == 50.
     assert config['death_penalty'] == 50.
-    assert config['pixels_per_reward'] == 8.
+    assert config['clear_reward'] == 50.
+    assert config['ppo_epochs'] == 4
+    assert config['ppo_minibatch_size'] == 16
+    assert config['target_kl'] == .02
+    assert config['discount_reference_frames'] == 20
+    assert config['optimizer_weight_decay'] == 0.
+    assert config['pixels_per_reward'] == 32.
     assert config['progress_clip'] == 5.
-    assert config['reward_version'] == 'signed-progress-v2'
+    assert config['reward_version'] == 'visual-frontier-v3'
     assert config['gap_bonus'] == 1.
     assert config['left_action_logit_bias'] == -3.
     assert config['entropy_coef'] == .001
@@ -207,6 +224,8 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     assert state['frames'] == 101 and state['updates'] == 5 and state['deaths'] == 2
     assert state['episode_seed'] == 9
     assert state['stagnant_decisions'] == 3
+    assert state['visual_position_px'] == (12. if legacy_visual_replay else 0.)
+    assert state['visual_frontier_px'] == (12. if legacy_visual_replay else 0.)
     assert state['recovery_active'] is False
     assert state['recovery_action_index'] == 0
     assert state['recovery_progress_window'] == []
@@ -224,16 +243,16 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     old_ids = payload['optimizer']['param_groups'][0]['params']
     actor_ids = [index for index, (name, _) in zip(old_ids, old_policy.named_parameters())
                  if name.startswith('actor.')]
-    assert set(optimizer['state']) == set(actor_ids)
+    assert optimizer['state'] == {}
+    assert optimizer['param_groups'][0]['weight_decay'] == 0.
     old_optimizer_ids = payload['optimizer']['param_groups'][0]['params']
     restored_optimizer_ids = optimizer['param_groups'][0]['params']
     assert restored_optimizer_ids[:len(old_optimizer_ids)] == old_optimizer_ids
     assert len(restored_optimizer_ids) == len(old_optimizer_ids) + 7
-    for index in actor_ids:
-        for name, value in payload['optimizer']['state'][index].items():
-            torch.testing.assert_close(optimizer['state'][index][name], value)
     events = [json.loads(line) for line in (tmp_path/'runs/train.jsonl').read_text().splitlines()]
     assert events[0]['event'] == 'started'
+    assert events[0]['visual_position_px'] == (10. if legacy_visual_replay else 0.)
+    assert events[0]['visual_frontier_px'] == (10. if legacy_visual_replay else 0.)
     assert events[0]['reward_objective_migrated'] is True
     assert events[0]['policy_behavior_migrated'] is True
     assert events[0]['critic_reset_for_reward_migration'] is True

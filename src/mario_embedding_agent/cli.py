@@ -14,7 +14,7 @@ from .encoder import FrozenEncoder, download_model, prepare_actions
 from .environment import make_env, step, COMMANDS
 from .policy import ActorCritic
 from .ppo import Transition, update
-from .rewards import StageDetector, GapDetector, RightwardProgress, reward
+from .rewards import StageDetector, GapDetector, RightwardProgress, ProgressFrontier, reward
 from .display import Display
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -94,8 +94,10 @@ def main():
     config = {'reward_scale': 50.0, 'image_tokens': 70, 'seed': args.seed,
               'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
-              'death_penalty': 50.0, 'pixels_per_reward': 8.0,
-              'progress_clip': 5.0, 'reward_version': 'signed-progress-v2',
+              'death_penalty': 50.0, 'clear_reward': 50.0, 'pixels_per_reward': 32.0,
+              'progress_clip': 5.0, 'reward_version': 'visual-frontier-v3',
+              'ppo_epochs': 4, 'ppo_minibatch_size': 16, 'target_kl': 0.02,
+              'discount_reference_frames': 20, 'optimizer_weight_decay': 0.0,
               'left_action_logit_bias': -3.0, 'entropy_coef': 0.001,
               'temporal_context': 'previous-embedding-delta-v1',
               'stagnation_threshold': 4, 'stagnation_deadband_px': 1.0,
@@ -122,7 +124,8 @@ def main():
         for key in ('movement_reward', 'motion_detector'):
             saved_config.pop(key, None)
         saved_config.update({key: config[key] for key in (
-            'reward_scale', 'death_penalty', 'pixels_per_reward', 'progress_clip', 'reward_version',
+            'reward_scale', 'death_penalty', 'clear_reward', 'pixels_per_reward', 'progress_clip', 'reward_version',
+            'ppo_epochs', 'ppo_minibatch_size', 'target_kl', 'discount_reference_frames', 'optimizer_weight_decay',
             'left_action_logit_bias', 'entropy_coef', 'temporal_context', 'stagnation_threshold',
             'stagnation_deadband_px', 'recovery_actions', 'recovery_logit_bias',
             'recovery_down_hold_frames', 'recovery_progress_px', 'recovery_progress_window',
@@ -139,7 +142,8 @@ def main():
     torch.set_num_threads(1)
     torch.manual_seed(config['seed'])
     policy = ActorCritic(embeddings, left_action_logit_bias=config['left_action_logit_bias'])
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=config['learning_rate'])
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=config['learning_rate'],
+                                 weight_decay=config['optimizer_weight_decay'])
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
              'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0,
              'stagnant_decisions': 0, 'recovery_active': False, 'recovery_action_index': 0,
@@ -156,6 +160,10 @@ def main():
             load_optimizer_state(optimizer, payload['optimizer'], policy)
             if args.command == 'train' and reward_objective_migrated:
                 reset_critic_value_scale(policy, optimizer)
+                optimizer.state.clear()  # Old-objective momentum is also stale for the actor.
+            for group in optimizer.param_groups:
+                group['lr'] = config['learning_rate']
+                group['weight_decay'] = config['optimizer_weight_decay']
             legacy_recovery_state = 'recovery_active' not in payload['training_state']
             state.update({k: v for k, v in payload['training_state'].items() if k != 'torch_rng_state'})
             if legacy_recovery_state and state['stagnant_decisions'] >= config['stagnation_threshold']:
@@ -169,6 +177,9 @@ def main():
     detector = StageDetector()
     gap_detector = GapDetector()
     motion = RightwardProgress()
+    legacy_frontier = bool(payload and args.command != 'evaluate' and
+                           'visual_frontier_px' not in payload['training_state'])
+    frontier = ProgressFrontier(state.get('visual_position_px', 0.0), state.get('visual_frontier_px', 0.0))
     motion.reset(frame)
     detector.observe(frame)
     gap_detector.observe(frame)
@@ -178,11 +189,18 @@ def main():
         if detector.observe(frame):
             gap_detector = GapDetector()
             motion.reset(frame)
+            if legacy_frontier:
+                frontier.reset()
         else:
             gap_detector.observe(frame)
-        motion.observe(frame)
+        replay_progress = motion.observe(frame)
+        if legacy_frontier:
+            frontier.observe(replay_progress)
+            frontier.claim()
         if died:
             raise ValueError('Saved episode replay unexpectedly terminated')
+    # A resumed run starts a new decision; do not credit a discarded partial action.
+    frontier.claim()
     display = None if args.headless else Display()
     logdir = ROOT/'runs'
     logdir.mkdir(exist_ok=True)
@@ -215,9 +233,14 @@ def main():
         log.flush()
 
     def state_counts():
-        return {k: state[k] for k in ('frames', 'decisions', 'updates', 'deaths', 'clears', 'gaps',
+        return {**{k: state[k] for k in ('frames', 'decisions', 'updates', 'deaths', 'clears', 'gaps',
                                       'stagnant_decisions', 'recovery_active', 'recovery_action_index',
-                                      'recovery_progress_window')}
+                                      'recovery_progress_window')},
+                'visual_position_px': frontier.position, 'visual_frontier_px': frontier.frontier}
+
+    def save_checkpoint():
+        state.update(visual_position_px=frontier.position, visual_frontier_px=frontier.frontier)
+        checkpoint.save(args.checkpoint, policy, optimizer, config, state)
 
     def reset_recovery():
         state['stagnant_decisions'] = 0
@@ -227,6 +250,12 @@ def main():
 
     def finish(raw, done, bootstrap=0.0, outcome='step'):
         nonlocal active, last_reward, metrics, save_due
+        new_progress = 0.0
+        if active is not None and outcome == 'step':
+            new_progress = frontier.claim()
+            raw = reward(False, False, new_progress, active['gap_bonus'],
+                         pixels_per_reward=config['pixels_per_reward'], progress_clip=config['progress_clip'],
+                         deadband_px=0.0)
         last_reward = raw
         if outcome in ('death', 'level_clear'):
             reset_recovery()
@@ -267,8 +296,11 @@ def main():
                 else:
                     reset_recovery()
             emit('decision_result', decision=state['decisions'], action=ACTIONS[active['action']].name,
-                 duration_frames=max(0, state['frames']-active['observed']),
+                 duration_frames=max(1, state['frames']-active['started']),
+                 input_age_frames=state['frames']-active['observed'],
                  displacement_px=round(active['right_progress'], 3), gap_bonus=active['gap_bonus'],
+                 new_frontier_px=round(new_progress, 3),
+                 executed_frames=max(1, state['frames']-active['started']),
                  recovery_evidence_events=recovery_evidence_events,
                  recovery_window_net_progress_px=round(recovery_window_net_progress, 3),
                  raw_reward=raw, scaled_reward=raw/config['reward_scale'], outcome=outcome,
@@ -276,11 +308,16 @@ def main():
             if args.command == 'train':
                 rollout.append(Transition(active['features'], active['action'], active['log_prob'],
                                           active['value'], raw/config['reward_scale'], done,
-                                          active['action_bias'], active['previous_features']))
+                                          active['action_bias'], active['previous_features'],
+                                          max(1, state['frames']-active['started'])))
         active = None
         if len(rollout) >= args.rollout:
+            update_started = time.perf_counter()
             metrics = update(policy, optimizer, rollout, bootstrap,
-                             entropy_coef=config['entropy_coef'])
+                             entropy_coef=config['entropy_coef'], epochs=config['ppo_epochs'],
+                             minibatch_size=config['ppo_minibatch_size'], target_kl=config['target_kl'],
+                             reference_frames=config['discount_reference_frames'])
+            metrics['update_ms'] = (time.perf_counter()-update_started)*1000
             rollout.clear()
             state['updates'] += 1
             save_due = True
@@ -292,6 +329,9 @@ def main():
         return features, (time.perf_counter()-before)*1000
 
     emit('started', mode=args.mode, gap_bonus=config['gap_bonus'], reward_objective_migrated=reward_objective_migrated,
+         reward_version=config['reward_version'], clear_reward=config['clear_reward'],
+         pixels_per_reward=config['pixels_per_reward'], ppo_epochs=config['ppo_epochs'],
+         target_kl=config['target_kl'], discount_reference_frames=config['discount_reference_frames'],
          critic_reset_for_reward_migration=bool(args.command == 'train' and payload and reward_objective_migrated),
          policy_behavior_migrated=policy_behavior_migrated,
          recovery_behavior_migrated=recovery_behavior_migrated,
@@ -332,10 +372,11 @@ def main():
                 with torch.no_grad():
                     bootstrap = float(policy(features, previous_features=state['previous_features'])[1])
                 if active is not None:
-                    finish(reward(False, False, active['right_progress'], active['gap_bonus'],
-                                  death_penalty=config['death_penalty'],
-                                  pixels_per_reward=config['pixels_per_reward'],
-                                  progress_clip=config['progress_clip']), False, bootstrap)
+                    finish(0.0, False, bootstrap)
+                else:
+                    # Startup/transition animation while no action exists must
+                    # not become reward for the first subsequently chosen action.
+                    frontier.claim()
                 recovery_action = None
                 action_bias = None
                 if state['recovery_active']:
@@ -353,7 +394,7 @@ def main():
                     commands = (('down',),)*config['recovery_down_hold_frames']
                 active = dict(features=features, previous_features=previous_features,
                               action=action, log_prob=log_prob, value=value,
-                              commands=commands, position=0, observed=observation[1], gap_bonus=0.0,
+                              commands=commands, position=0, observed=observation[1], started=state['frames'], gap_bonus=0.0,
                               right_progress=0.0, recovery_action=recovery_action, action_bias=action_bias)
                 state['previous_features'] = features.detach().clone()
                 policy_frame = observation[2]
@@ -364,12 +405,15 @@ def main():
             command = ()
             if active is not None:
                 position = active['position']
-                command = active['commands'][min(position, len(active['commands'])-1)]
+                # Respect the macro duration while the next embedding is pending.
+                # Holding the final direction indefinitely can walk into a gap.
+                command = active['commands'][position] if position < len(active['commands']) else ()
                 active['position'] += 1
             frame, died = step(env, command)
             state['frames'] += 1
             state['episode_commands'].append(COMMANDS.index(command))
             right_progress = motion.observe(frame)
+            frontier.observe(right_progress)
             if right_progress is not None and active is not None:
                 active['right_progress'] += right_progress
             cleared = detector.observe(frame)
@@ -384,8 +428,10 @@ def main():
                 outcome = 'death' if died else 'clear'
                 image_path = logdir/f'{outcome}-{state["frames"]}.png'
                 Image.fromarray(frame).save(image_path)
-                finish(reward(died, cleared, death_penalty=config['death_penalty']), True,
+                finish(reward(died, cleared, death_penalty=config['death_penalty'],
+                              clear_reward=config['clear_reward']), True,
                        outcome='death' if died else 'level_clear')
+                frontier.reset()
                 state['previous_features'] = None
                 state['deaths' if died else 'clears'] += 1
                 emit(outcome, raw_reward=last_reward, captured_frame=str(image_path))
@@ -437,7 +483,7 @@ def main():
             if stop_evaluation:
                 break
             if args.command == 'train' and save_due:
-                checkpoint.save(args.checkpoint, policy, optimizer, config, state)
+                save_checkpoint()
                 save_due = False
             elapsed = max(time.perf_counter()-started, .001)
             fps = (state['frames']-start_frames)/elapsed
@@ -452,11 +498,12 @@ def main():
                 recovery_net = sum(state['recovery_progress_window'])
                 lines = [f'{args.command} / {args.mode}', f'FPS {fps:.1f}  decisions/s {dps:.2f}',
                          f'Frame {state["frames"]}', f'Action: {ACTIONS[active["action"]].name if active else "waiting"}',
-                         'Temporal: prior/current embedding delta',
                          f'Encoder {inference_ms:.1f} ms', f'Input age {state["frames"]-active["observed"] if active else 0} frames',
                          f'Stagnant decisions {state["stagnant_decisions"]}',
                          f'Recovery {recovery}  {recovery_evidence}/{config["recovery_progress_events_required"]}  {recovery_net:+.0f}px',
-                         f'Rollout {len(rollout)}/{args.rollout}', f'PPO updates {state["updates"]}',
+                         f'New ground {frontier.frontier:.0f}px',
+                         f'Rollout {len(rollout)}/{args.rollout}, actor {metrics.get("actor_samples", 0)}',
+                         f'Updates {state["updates"]} KL {metrics.get("final_kl", 0):.3g}',
                          f'Dead {state["deaths"]} clear {state["clears"]} gaps {state["gaps"]}', f'Reward {last_reward:g} / {last_reward/config["reward_scale"]:g}',
                          *[f'{k}: {metrics[k]:.4g}' for k in ('policy_loss', 'value_loss', 'entropy', 'explained_variance') if isinstance(metrics.get(k), (float, int))],
                          'Top action probabilities:',
@@ -474,7 +521,8 @@ def main():
     finally:
         worker.shutdown(wait=True, cancel_futures=True)
         if args.command == 'train':
-            checkpoint.save(args.checkpoint, policy, optimizer, config, state)
+            frontier.claim()
+            save_checkpoint()
         if args.command == 'evaluate':
             completed = evaluation['episodes']
             emit('evaluation_complete', requested_episodes=args.episodes, completed_episodes=completed,

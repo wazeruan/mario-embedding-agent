@@ -2,6 +2,28 @@
 import numpy as np
 
 
+class ProgressFrontier:
+    """Pay only for new visual ground, allowing unrewarded retreats and retraces."""
+    def __init__(self, position=0.0, frontier=0.0):
+        self.position = float(position)
+        self.frontier = float(frontier)
+        self.pending = 0.0
+
+    def observe(self, displacement):
+        if displacement is not None:
+            self.position += float(displacement)
+            self.pending += max(0.0, self.position-self.frontier)
+            self.frontier = max(self.frontier, self.position)
+
+    def claim(self):
+        advance = self.pending
+        self.pending = 0.0
+        return advance
+
+    def reset(self):
+        self.position = self.frontier = self.pending = 0.0
+
+
 class StageDetector:
     def __init__(self):
         self.baseline = None
@@ -32,14 +54,15 @@ class StageDetector:
 
 
 def reward(death, cleared, displacement=0.0, gap_bonus=0.0, *,
-           death_penalty=50.0, pixels_per_reward=8.0, progress_clip=5.0):
+           death_penalty=50.0, pixels_per_reward=8.0, progress_clip=5.0, clear_reward=1.0,
+           deadband_px=1.0):
     """Signed pixel progress, with terminal outcomes taking precedence."""
     if death:
         return -float(death_penalty)
     if cleared:
-        return 1.0
+        return float(clear_reward)
     pixels = float(displacement)
-    if abs(pixels) <= 1.0:
+    if abs(pixels) <= deadband_px:
         pixels = 0.0  # Suppress subpixel sprite jitter.
     progress = np.clip(pixels / pixels_per_reward, -progress_clip, progress_clip)
     return float(progress) + float(gap_bonus)
