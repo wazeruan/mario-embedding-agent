@@ -30,19 +30,25 @@ def reset_critic_value_scale(policy, optimizer):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['prepare', 'train', 'play'])
+    parser.add_argument('command', choices=['prepare', 'train', 'play', 'evaluate'])
     parser.add_argument('--device', default='auto')
     parser.add_argument('--headless', action='store_true')
-    parser.add_argument('--mode', choices=['sync', 'realtime'], default='realtime')
+    parser.add_argument('--mode', choices=['sync', 'realtime'],
+                        help='Emulator pacing; defaults to sync for evaluation and realtime otherwise')
     parser.add_argument('--fps', type=float, default=60)
     parser.add_argument('--rollout', type=int, default=16)
     parser.add_argument('--total-frames', type=int, help='Explicit bounded diagnostic only; otherwise unbounded')
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--checkpoint', type=Path, default=ROOT/'checkpoints/latest.pt')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--episodes', type=int, default=10,
+                        help='Death-ended evaluation attempts before stopping')
     args = parser.parse_args()
+    args.mode = args.mode or ('sync' if args.command == 'evaluate' else 'realtime')
     if args.fps <= 0 or args.rollout < 2 or (args.total_frames is not None and args.total_frames <= 0):
         parser.error('fps must be positive, rollout >= 2, total-frames positive')
+    if args.command == 'evaluate' and (args.episodes <= 0 or args.total_frames is not None):
+        parser.error('evaluate requires positive --episodes and stops only at death, not by frame count')
     directory = ROOT/'models/embeddinggemma-2'
     if args.command == 'prepare':
         download_model(directory)
@@ -51,7 +57,7 @@ def main():
     if args.command == 'prepare':
         print(f'Prepared {len(ACTIONS)} actions: {tuple(embeddings.shape)}')
         return
-    payload = checkpoint.load(args.resume or args.checkpoint) if args.resume or args.command == 'play' else None
+    payload = checkpoint.load(args.resume or args.checkpoint) if args.resume or args.command in ('play', 'evaluate') else None
     config = {'reward_scale': 50.0, 'image_tokens': 70, 'seed': args.seed,
               'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
@@ -94,13 +100,19 @@ def main():
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
              'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0,
              'stagnant_decisions': 0}
+    if args.command == 'evaluate':
+        state['episode_seed'] = args.seed
     if payload:
         policy.load_state_dict(payload['policy'])
-        optimizer.load_state_dict(payload['optimizer'])
-        if args.command == 'train' and reward_objective_migrated:
-            reset_critic_value_scale(policy, optimizer)
-        state.update({k: v for k, v in payload['training_state'].items() if k != 'torch_rng_state'})
-        torch.set_rng_state(payload['training_state']['torch_rng_state'])
+        if args.command == 'evaluate':
+            # Evaluate fresh, death-ended attempts under an explicit seed sequence.
+            state['episode_commands'] = []
+        else:
+            optimizer.load_state_dict(payload['optimizer'])
+            if args.command == 'train' and reward_objective_migrated:
+                reset_critic_value_scale(policy, optimizer)
+            state.update({k: v for k, v in payload['training_state'].items() if k != 'torch_rng_state'})
+            torch.set_rng_state(payload['training_state']['torch_rng_state'])
     env = make_env()
     frame, _ = env.reset(seed=state['episode_seed'])
     detector = StageDetector()
@@ -135,6 +147,13 @@ def main():
     probabilities = []
     last_reward = 0.0
     inference_ms = 0.0
+    evaluation = {'episodes': 0, 'frames': [], 'decisions': [], 'raw_rewards': [],
+                  'rightward_progress_px': [], 'gap_crossings': [], 'world_transitions': [],
+                  'episode_start_frames': state['frames'],
+                  'episode_start_decisions': state['decisions'],
+                  'episode_start_gaps': state['gaps'], 'episode_start_clears': state['clears'],
+                  'episode_raw_reward': 0.0, 'episode_progress_px': 0.0}
+    stop_evaluation = False
     started = time.perf_counter()
     start_frames, start_decisions = state['frames'], state['decisions']
     next_tick = started
@@ -153,6 +172,12 @@ def main():
         last_reward = raw
         if outcome in ('death', 'level_clear'):
             state['stagnant_decisions'] = 0
+        if args.command == 'evaluate':
+            # Count terminal rewards even if the death/transition lands while
+            # the controller has no active policy decision to credit.
+            evaluation['episode_raw_reward'] += raw
+            if active is not None:
+                evaluation['episode_progress_px'] += active['right_progress']
         if active is not None:
             if outcome not in ('death', 'level_clear') and (
                   active['right_progress'] <= config['stagnation_deadband_px'] and
@@ -183,7 +208,7 @@ def main():
         features = encoder.encode_frame(image)
         return features, (time.perf_counter()-before)*1000
 
-    emit('started', gap_bonus=config['gap_bonus'], reward_objective_migrated=reward_objective_migrated,
+    emit('started', mode=args.mode, gap_bonus=config['gap_bonus'], reward_objective_migrated=reward_objective_migrated,
          critic_reset_for_reward_migration=bool(args.command == 'train' and payload and reward_objective_migrated),
          policy_behavior_migrated=policy_behavior_migrated,
          recovery_behavior_migrated=recovery_behavior_migrated,
@@ -192,7 +217,8 @@ def main():
          recovery_logit_bias=config['recovery_logit_bias'])
     print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
     try:
-        while args.total_frames is None or state['frames']-start_frames < args.total_frames:
+        while (not stop_evaluation and
+               (args.total_frames is None or state['frames']-start_frames < args.total_frames)):
             now = time.perf_counter()
             ready_for_decision = active is None or active['position'] >= len(active['commands'])
             if ready_for_decision and future is None:
@@ -271,12 +297,48 @@ def main():
                 if cleared:
                     motion.reset(frame)
                 if died:
-                    state['episode_seed'] += 1
-                    state['episode_commands'] = []
-                    frame, _ = env.reset(seed=state['episode_seed'])
-                    motion.reset(frame)
-                    detector = StageDetector()
-                    detector.observe(frame)
+                    if args.command == 'evaluate':
+                        evaluation['episodes'] += 1
+                        episode_frames = state['frames']-evaluation['episode_start_frames']
+                        episode_decisions = state['decisions']-evaluation['episode_start_decisions']
+                        episode_gaps = state['gaps']-evaluation['episode_start_gaps']
+                        episode_clears = state['clears']-evaluation['episode_start_clears']
+                        evaluation['frames'].append(episode_frames)
+                        evaluation['decisions'].append(episode_decisions)
+                        evaluation['raw_rewards'].append(evaluation['episode_raw_reward'])
+                        evaluation['rightward_progress_px'].append(evaluation['episode_progress_px'])
+                        evaluation['gap_crossings'].append(episode_gaps)
+                        evaluation['world_transitions'].append(episode_clears)
+                        emit('evaluation_episode', episode=evaluation['episodes'], seed=state['episode_seed'],
+                             frames=episode_frames, decisions=episode_decisions,
+                             raw_reward=evaluation['episode_raw_reward'],
+                             rightward_progress_px=evaluation['episode_progress_px'],
+                             gap_crossings=episode_gaps, world_transitions=episode_clears,
+                             died=True)
+                        if evaluation['episodes'] >= args.episodes:
+                            stop_evaluation = True
+                        else:
+                            state['episode_seed'] += 1
+                            state['episode_commands'] = []
+                            frame, _ = env.reset(seed=state['episode_seed'])
+                            motion.reset(frame)
+                            detector = StageDetector()
+                            detector.observe(frame)
+                            evaluation['episode_start_frames'] = state['frames']
+                            evaluation['episode_start_decisions'] = state['decisions']
+                            evaluation['episode_start_gaps'] = state['gaps']
+                            evaluation['episode_start_clears'] = state['clears']
+                            evaluation['episode_raw_reward'] = 0.0
+                            evaluation['episode_progress_px'] = 0.0
+                    else:
+                        state['episode_seed'] += 1
+                        state['episode_commands'] = []
+                        frame, _ = env.reset(seed=state['episode_seed'])
+                        motion.reset(frame)
+                        detector = StageDetector()
+                        detector.observe(frame)
+            if stop_evaluation:
+                break
             if args.command == 'train' and save_due:
                 checkpoint.save(args.checkpoint, policy, optimizer, config, state)
                 save_due = False
@@ -308,6 +370,16 @@ def main():
         worker.shutdown(wait=True, cancel_futures=True)
         if args.command == 'train':
             checkpoint.save(args.checkpoint, policy, optimizer, config, state)
+        if args.command == 'evaluate':
+            completed = evaluation['episodes']
+            emit('evaluation_complete', requested_episodes=args.episodes, completed_episodes=completed,
+                 complete=completed == args.episodes,
+                 mean_frames=(sum(evaluation['frames'])/completed if completed else None),
+                 mean_decisions=(sum(evaluation['decisions'])/completed if completed else None),
+                 mean_raw_reward=(sum(evaluation['raw_rewards'])/completed if completed else None),
+                 mean_rightward_progress_px=(sum(evaluation['rightward_progress_px'])/completed if completed else None),
+                 total_gap_crossings=sum(evaluation['gap_crossings']),
+                 total_world_transitions=sum(evaluation['world_transitions']))
         emit('stopped', partial_rollout_discarded=len(rollout))
         log.close()
         env.close()

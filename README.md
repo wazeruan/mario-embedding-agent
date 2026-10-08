@@ -21,9 +21,12 @@ The default visible realtime mode keeps the emulator running at a target of 60 F
 uv run mario-agent train --resume checkpoints/latest.pt
 uv run mario-agent play --checkpoint checkpoints/latest.pt
 uv run mario-agent train --mode sync
+uv run mario-agent evaluate --checkpoint checkpoints/latest.pt --episodes 10 --seed 0 --mode sync
 ```
 
-Sync pauses emulator advancement during encoding, so each decision uses the current screenshot. Its wall-clock game rate is slower; this mode helps inspect mistakes without inference staleness. `--fps 30` slows emulator pacing in either mode. There is no default time or frame cutoff. Close the window, press Escape or Ctrl+C to stop and save. `--headless --total-frames 600` is an explicit finite diagnostic. Models must be prepared before train/play. Checkpoints from the previous LoRA implementation are incompatible.
+Sync pauses emulator advancement during encoding, so each decision uses the current screenshot. Its wall-clock game rate is slower; this mode helps inspect mistakes without inference staleness. `--fps 30` slows emulator pacing in either mode. There is no default time or frame cutoff. Close the window, press Escape or Ctrl+C to stop and save. `--headless --total-frames 600` is an explicit finite diagnostic. Models must be prepared before train/play/evaluate. Checkpoints from the previous LoRA implementation are incompatible.
+
+`evaluate` loads a checkpoint's policy and runs deterministic argmax actions without updating or saving weights. It reports each death-ended attempt plus aggregate frames, decisions, screenshot-derived reward/progress, detected gap crossings and world transitions. Seeds advance only after a visually observed death; there is no per-attempt time/frame cutoff. This is a frozen-policy comparison, not proof of final-game completion; the existing clear detector sees intermediate WORLD transitions.
 
 ## Actions and objective
 
