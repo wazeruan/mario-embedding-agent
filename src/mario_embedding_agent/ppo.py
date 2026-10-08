@@ -14,6 +14,7 @@ class Transition:
     reward: float
     done: bool
     action_bias: torch.Tensor | None = None
+    previous_features: torch.Tensor | None = None
 
 
 def gae(transitions, bootstrap_value, gamma=0.99, gae_lambda=0.95):
@@ -36,6 +37,11 @@ def update(policy, optimizer, transitions, bootstrap_value, *, epochs=2, minibat
     if not transitions:
         raise ValueError('Cannot update an empty rollout.')
     features = torch.stack([item.features.detach().clone() for item in transitions])
+    previous_features = torch.stack([
+        item.features.detach().clone() if item.previous_features is None
+        else item.previous_features.detach().clone()
+        for item in transitions
+    ])
     actions = torch.tensor([item.action for item in transitions], dtype=torch.long)
     action_biases = torch.stack([
         torch.zeros(policy.actor.out_features) if item.action_bias is None
@@ -49,7 +55,8 @@ def update(policy, optimizer, transitions, bootstrap_value, *, epochs=2, minibat
     metrics = {key: [] for key in ('policy_loss', 'value_loss', 'entropy', 'approx_kl', 'clip_fraction')}
     for _ in range(epochs):
         for indices in torch.randperm(len(transitions)).split(minibatch_size):
-            logits, values = policy(features[indices], action_bias=action_biases[indices])
+            logits, values = policy(features[indices], action_bias=action_biases[indices],
+                                    previous_features=previous_features[indices])
             dist = Categorical(logits=logits)
             logs = dist.log_prob(actions[indices])
             log_ratio = logs - old_logs[indices]
@@ -73,7 +80,7 @@ def update(policy, optimizer, transitions, bootstrap_value, *, epochs=2, minibat
                 metrics[key].append(float(value.detach()))
     result = {key: sum(values)/len(values) for key, values in metrics.items()}
     with torch.no_grad():
-        predictions = policy(features)[1]
+        predictions = policy(features, previous_features=previous_features)[1]
         variance = returns.var(unbiased=False)
         result['explained_variance'] = float(1-(returns-predictions).var(unbiased=False)/variance) if variance > 1e-12 else None
     result['mean_learning_reward'] = sum(item.reward for item in transitions)/len(transitions)

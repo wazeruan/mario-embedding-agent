@@ -62,7 +62,7 @@ def test_cli_four_stagnant_decisions_schedule_and_reset_recovery(monkeypatch, tm
         frame = np.zeros((240, 256, 3), dtype=np.uint8)
         frame[0, 0, 0] = env.frames
         return frame, reset_reason == 'death' and env.frames == 18
-    def act(self, features, sample=True, action_bias=None):
+    def act(self, features, sample=True, action_bias=None, previous_features=None):
         biases.append(None if action_bias is None else action_bias.clone())
         return 0, 0., 0., [1.] + [0.] * 17
     def ppo(policy, optimizer, rollout, bootstrap, **kwargs):

@@ -48,6 +48,36 @@ def test_actor_initializes_cosine_logits_but_learns_independently():
     torch.testing.assert_close(values, torch.zeros(3))
 
 
+def test_temporal_adapters_start_as_noop_and_receive_learning_gradients():
+    policy = ActorCritic(vectors())
+    current = F.normalize(torch.randn(768, generator=torch.Generator().manual_seed(4)), dim=0)
+    previous = F.normalize(torch.randn(768, generator=torch.Generator().manual_seed(5)), dim=0)
+    single_frame = policy(current)
+    temporal = policy(current, previous_features=previous)
+    torch.testing.assert_close(temporal[0], single_frame[0])
+    torch.testing.assert_close(temporal[1], single_frame[1])
+    logits, values = policy(current, previous_features=previous)
+    (logits[0] + values).backward()
+    assert policy.temporal_actor.weight.grad.norm() > 0
+    assert policy.temporal_critic[-1].weight.grad.norm() > 0
+
+
+def test_actor_rejects_mismatched_previous_embedding_shape():
+    policy = ActorCritic(vectors())
+    with pytest.raises(ValueError, match='same shape'):
+        policy(torch.ones(768), previous_features=torch.ones(2, 768))
+
+
+def test_policy_checkpoint_migration_rejects_partial_temporal_heads():
+    from mario_embedding_agent.cli import load_policy_weights
+
+    policy = ActorCritic(vectors())
+    weights = policy.state_dict()
+    weights.pop('temporal_actor.weight')
+    with pytest.raises(ValueError, match='policy keys are incompatible'):
+        load_policy_weights(policy, weights)
+
+
 def test_gae_death_cuts_bootstrap_and_next_episode_rewards():
     f = torch.zeros(768)
     rollout = [Transition(f, 0, 0, .2, -.001, False),
@@ -85,6 +115,24 @@ def test_ppo_updates_actor_and_critic_with_frozen_features_only():
     assert all(int(s['step']) == 4 for s in optimizer.state.values())
 
 
+def test_ppo_reuses_saved_previous_embeddings_for_action_probabilities():
+    policy = ActorCritic(vectors())
+    optimizer = torch.optim.Adam(policy.parameters(), lr=0.)
+    # Make temporal context observable so this catches a dropped prev-frame input.
+    with torch.no_grad():
+        policy.temporal_actor.weight.normal_(std=.5, generator=torch.Generator().manual_seed(24))
+    rollout = []
+    for index in range(8):
+        previous = F.normalize(torch.randn(768, generator=torch.Generator().manual_seed(index)), dim=0)
+        current = F.normalize(torch.randn(768, generator=torch.Generator().manual_seed(index + 10)), dim=0)
+        action, log_prob, value, _ = policy.act(current, previous_features=previous)
+        rollout.append(Transition(current, action, log_prob, value, .1, index == 7,
+                                  previous_features=previous))
+    metrics = update(policy, optimizer, rollout, 0., epochs=1, minibatch_size=8)
+    assert metrics['approx_kl'] == pytest.approx(0., abs=1e-7)
+    assert metrics['clip_fraction'] == 0.
+
+
 def test_checkpoint_roundtrip_and_incompatible_manifest(tmp_path):
     policy = ActorCritic(vectors())
     optimizer = torch.optim.Adam(policy.parameters())
@@ -97,6 +145,10 @@ def test_checkpoint_roundtrip_and_incompatible_manifest(tmp_path):
     restored.load_state_dict(payload['policy'])
     for a, b in zip(policy.parameters(), restored.parameters()):
         torch.testing.assert_close(a, b)
+    payload['format'] = 'mario-direct-actor-ppo-v1'
+    torch.save(payload, path)
+    assert checkpoint.load(path)['format'] == 'mario-direct-actor-ppo-v1'
+    payload = checkpoint.load(path)
     payload['actions'][0]['hold_frames'] += 1
     torch.save(payload, path)
     with pytest.raises(ValueError, match='architecture'):

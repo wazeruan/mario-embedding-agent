@@ -1,6 +1,7 @@
 """Prepare, train and play the screenshot-only Mario policy."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import json
 from pathlib import Path
 import time
@@ -22,10 +23,42 @@ ROOT = Path(__file__).resolve().parents[2]
 def reset_critic_value_scale(policy, optimizer):
     """Keep learned critic features but clear value output and stale Adam moments."""
     with torch.no_grad():
-        policy.critic[-1].weight.zero_()
-        policy.critic[-1].bias.zero_()
-    for parameter in policy.critic.parameters():
-        optimizer.state.pop(parameter, None)
+        for critic in (policy.critic, policy.temporal_critic):
+            critic[-1].weight.zero_()
+            critic[-1].bias.zero_()
+    for critic in (policy.critic, policy.temporal_critic):
+        for parameter in critic.parameters():
+            optimizer.state.pop(parameter, None)
+
+
+def load_policy_weights(policy, weights):
+    """Allow a pre-temporal checkpoint to start with zeroed temporal adapters."""
+    result = policy.load_state_dict(weights, strict=False)
+    allowed_missing = {name for name in policy.state_dict()
+                       if name.startswith(('temporal_actor.', 'temporal_critic.'))}
+    missing = set(result.missing_keys)
+    unexpected = set(result.unexpected_keys)
+    if (missing and missing != allowed_missing) or unexpected:
+        raise ValueError(f'Checkpoint policy keys are incompatible: missing={sorted(missing)}, '
+                         f'unexpected={sorted(unexpected)}')
+    return bool(missing)
+
+
+def load_optimizer_state(optimizer, saved_state, policy):
+    """Extend legacy AdamW parameter IDs for newly added temporal adapters."""
+    saved_state = deepcopy(saved_state)
+    if len(saved_state['param_groups']) == len(optimizer.param_groups) == 1:
+        group = saved_state['param_groups'][0]
+        saved_ids = group['params']
+        current_count = len(optimizer.param_groups[0]['params'])
+        legacy_count = sum(not name.startswith(('temporal_actor.', 'temporal_critic.'))
+                           for name, _ in policy.named_parameters())
+        if len(saved_ids) == legacy_count and current_count > legacy_count:
+            first_new_id = max(saved_ids, default=-1) + 1
+            group['params'] = [*saved_ids, *range(first_new_id, first_new_id + current_count - legacy_count)]
+        elif len(saved_ids) != current_count:
+            raise ValueError('Checkpoint optimizer parameter layout is incompatible with the policy.')
+    optimizer.load_state_dict(saved_state)
 
 
 def main():
@@ -64,18 +97,21 @@ def main():
               'death_penalty': 50.0, 'pixels_per_reward': 8.0,
               'progress_clip': 5.0, 'reward_version': 'signed-progress-v2',
               'left_action_logit_bias': -3.0, 'entropy_coef': 0.001,
+              'temporal_context': 'previous-embedding-delta-v1',
               'stagnation_threshold': 4, 'stagnation_deadband_px': 1.0,
               'recovery_actions': ['down', 'run_left', 'run_right_jump_long', 'right_jump_short'],
               'recovery_logit_bias': 8.0}
     reward_objective_migrated = False
     policy_behavior_migrated = False
     recovery_behavior_migrated = False
+    temporal_context_migrated = False
     if payload:
         # Preserve learned weights and optimizer while replacing old reward settings.
         saved_config = dict(payload['config'])
         old_reward_version = saved_config.get('reward_version')
         old_left_bias = saved_config.get('left_action_logit_bias')
         old_entropy_coef = saved_config.get('entropy_coef')
+        old_temporal_context = saved_config.get('temporal_context')
         recovery_keys = ('stagnation_threshold', 'stagnation_deadband_px',
                          'recovery_actions', 'recovery_logit_bias')
         recovery_behavior_migrated = any(saved_config.get(key) != config[key] for key in recovery_keys)
@@ -83,13 +119,14 @@ def main():
             saved_config.pop(key, None)
         saved_config.update({key: config[key] for key in (
             'reward_scale', 'death_penalty', 'pixels_per_reward', 'progress_clip', 'reward_version',
-            'left_action_logit_bias', 'entropy_coef', 'stagnation_threshold',
+            'left_action_logit_bias', 'entropy_coef', 'temporal_context', 'stagnation_threshold',
             'stagnation_deadband_px', 'recovery_actions', 'recovery_logit_bias')})
         saved_config.setdefault('gap_bonus', 1.0)
         saved_config.setdefault('gap_detector', 'overworld-rgb-v1')
         reward_objective_migrated = old_reward_version != config['reward_version']
         policy_behavior_migrated = (old_left_bias != config['left_action_logit_bias'] or
                                     old_entropy_coef != config['entropy_coef'])
+        temporal_context_migrated = old_temporal_context != config['temporal_context']
         if {k: v for k, v in saved_config.items() if k != 'seed'} != {k: v for k, v in config.items() if k != 'seed'}:
             raise ValueError('Checkpoint training configuration is incompatible')
         config = saved_config
@@ -99,16 +136,17 @@ def main():
     optimizer = torch.optim.AdamW(policy.parameters(), lr=config['learning_rate'])
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
              'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0,
-             'stagnant_decisions': 0}
+             'stagnant_decisions': 0, 'previous_features': None}
     if args.command == 'evaluate':
         state['episode_seed'] = args.seed
     if payload:
-        policy.load_state_dict(payload['policy'])
+        temporal_weights_migrated = load_policy_weights(policy, payload['policy'])
+        temporal_context_migrated = temporal_context_migrated or temporal_weights_migrated
         if args.command == 'evaluate':
             # Evaluate fresh, death-ended attempts under an explicit seed sequence.
             state['episode_commands'] = []
         else:
-            optimizer.load_state_dict(payload['optimizer'])
+            load_optimizer_state(optimizer, payload['optimizer'], policy)
             if args.command == 'train' and reward_objective_migrated:
                 reset_critic_value_scale(policy, optimizer)
             state.update({k: v for k, v in payload['training_state'].items() if k != 'torch_rng_state'})
@@ -193,7 +231,7 @@ def main():
             if args.command == 'train':
                 rollout.append(Transition(active['features'], active['action'], active['log_prob'],
                                           active['value'], raw/config['reward_scale'], done,
-                                          active['action_bias']))
+                                          active['action_bias'], active['previous_features']))
         active = None
         if len(rollout) >= args.rollout:
             metrics = update(policy, optimizer, rollout, bootstrap,
@@ -212,10 +250,12 @@ def main():
          critic_reset_for_reward_migration=bool(args.command == 'train' and payload and reward_objective_migrated),
          policy_behavior_migrated=policy_behavior_migrated,
          recovery_behavior_migrated=recovery_behavior_migrated,
+         temporal_context=config['temporal_context'], temporal_context_migrated=temporal_context_migrated,
          left_action_logit_bias=config['left_action_logit_bias'], entropy_coef=config['entropy_coef'],
          stagnation_threshold=config['stagnation_threshold'], recovery_actions=config['recovery_actions'],
          recovery_logit_bias=config['recovery_logit_bias'])
-    print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
+    print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; temporal=embedding delta; '
+          f'PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
     try:
         while (not stop_evaluation and
                (args.total_frames is None or state['frames']-start_frames < args.total_frames)):
@@ -240,7 +280,7 @@ def main():
             if ready is not None:
                 features, observation = ready
                 with torch.no_grad():
-                    bootstrap = float(policy(features)[1])
+                    bootstrap = float(policy(features, previous_features=state['previous_features'])[1])
                 if active is not None:
                     finish(reward(False, False, active['right_progress'], active['gap_bonus'],
                                   death_penalty=config['death_penalty'],
@@ -255,11 +295,15 @@ def main():
                     action_bias = torch.zeros(len(ACTIONS))
                     recovery_index = next(i for i, item in enumerate(ACTIONS) if item.name == recovery_action)
                     action_bias[recovery_index] = config['recovery_logit_bias']
+                previous_features = state['previous_features']
                 action, log_prob, value, probabilities = policy.act(
-                    features, sample=args.command == 'train', action_bias=action_bias)
-                active = dict(features=features, action=action, log_prob=log_prob, value=value,
+                    features, sample=args.command == 'train', action_bias=action_bias,
+                    previous_features=previous_features)
+                active = dict(features=features, previous_features=previous_features,
+                              action=action, log_prob=log_prob, value=value,
                               commands=ACTIONS[action].commands(), position=0, observed=observation[1], gap_bonus=0.0,
                               right_progress=0.0, recovery_action=recovery_action, action_bias=action_bias)
+                state['previous_features'] = features.detach().clone()
                 policy_frame = observation[2]
                 state['decisions'] += 1
                 emit('decision', action=ACTIONS[action].name, inference_ms=inference_ms,
@@ -290,6 +334,7 @@ def main():
                 Image.fromarray(frame).save(image_path)
                 finish(reward(died, cleared, death_penalty=config['death_penalty']), True,
                        outcome='death' if died else 'level_clear')
+                state['previous_features'] = None
                 state['deaths' if died else 'clears'] += 1
                 emit(outcome, raw_reward=last_reward, captured_frame=str(image_path))
                 generation += 1
@@ -349,6 +394,7 @@ def main():
                 recovery = active['recovery_action'] if active and active['recovery_action'] else 'off'
                 lines = [f'{args.command} / {args.mode}', f'FPS {fps:.1f}  decisions/s {dps:.2f}',
                          f'Frame {state["frames"]}', f'Action: {ACTIONS[active["action"]].name if active else "waiting"}',
+                         'Temporal: prior/current embedding delta',
                          f'Encoder {inference_ms:.1f} ms', f'Input age {state["frames"]-active["observed"] if active else 0} frames',
                          f'Stagnant decisions {state["stagnant_decisions"]}  recovery {recovery}',
                          f'Rollout {len(rollout)}/{args.rollout}', f'PPO updates {state["updates"]}',

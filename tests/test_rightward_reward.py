@@ -127,9 +127,11 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     old_policy = cli.ActorCritic(torch.ones(18, 768))
     with torch.no_grad():
         old_policy.actor.bias.fill_(.42)
-    old_optimizer = torch.optim.AdamW(old_policy.parameters(), lr=3e-4)
+    legacy_parameters = [parameter for name, parameter in old_policy.named_parameters()
+                         if not name.startswith(('temporal_actor.', 'temporal_critic.'))]
+    old_optimizer = torch.optim.AdamW(legacy_parameters, lr=3e-4)
     # Populate Adam moments for actor and critic, including nonzero value output.
-    for parameter in old_policy.parameters():
+    for parameter in legacy_parameters:
         parameter.grad = torch.ones_like(parameter)
     old_optimizer.step()
     old_optimizer.zero_grad(set_to_none=True)
@@ -144,7 +146,9 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
         old_config.update(stagnation_threshold=4, stagnation_deadband_px=1.,
                           recovery_actions=['down', 'run_left', 'run_right_jump_long', 'right_jump_short'],
                           recovery_logit_bias=8.)
-    payload = {'config': old_config, 'policy': old_policy.state_dict(),
+    legacy_policy = {name: value for name, value in old_policy.state_dict().items()
+                     if not name.startswith(('temporal_actor.', 'temporal_critic.'))}
+    payload = {'config': old_config, 'policy': legacy_policy,
                'optimizer': old_optimizer.state_dict(),
                'training_state': {'frames': 100, 'decisions': 20, 'updates': 5,
                                   'deaths': 2, 'clears': 0, 'episode_seed': 9,
@@ -197,6 +201,9 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     assert state['episode_seed'] == 9
     assert state['stagnant_decisions'] == 3
     assert torch.equal(weights['actor.bias'], payload['policy']['actor.bias'])
+    assert torch.count_nonzero(weights['temporal_actor.weight']) == 0
+    assert torch.count_nonzero(weights['temporal_critic.3.weight']) == 0
+    assert torch.count_nonzero(weights['temporal_critic.3.bias']) == 0
     final_prefix = f'critic.{len(old_policy.critic)-1}.'
     for name, tensor in payload['policy'].items():
         if name.startswith(final_prefix):
@@ -208,7 +215,10 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     actor_ids = [index for index, (name, _) in zip(old_ids, old_policy.named_parameters())
                  if name.startswith('actor.')]
     assert set(optimizer['state']) == set(actor_ids)
-    assert optimizer['param_groups'] == payload['optimizer']['param_groups']
+    old_optimizer_ids = payload['optimizer']['param_groups'][0]['params']
+    restored_optimizer_ids = optimizer['param_groups'][0]['params']
+    assert restored_optimizer_ids[:len(old_optimizer_ids)] == old_optimizer_ids
+    assert len(restored_optimizer_ids) == len(old_optimizer_ids) + 7
     for index in actor_ids:
         for name, value in payload['optimizer']['state'][index].items():
             torch.testing.assert_close(optimizer['state'][index][name], value)
@@ -218,4 +228,5 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     assert events[0]['policy_behavior_migrated'] is True
     assert events[0]['critic_reset_for_reward_migration'] is True
     assert events[0]['recovery_behavior_migrated'] is (not current_recovery_config)
+    assert events[0]['temporal_context_migrated'] is True
     assert events[0]['stagnant_decisions'] == 3
