@@ -57,20 +57,28 @@ def main():
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
               'death_penalty': 50.0, 'pixels_per_reward': 8.0,
               'progress_clip': 5.0, 'reward_version': 'signed-progress-v2',
-              'left_action_logit_bias': -3.0, 'entropy_coef': 0.001}
+              'left_action_logit_bias': -3.0, 'entropy_coef': 0.001,
+              'stagnation_threshold': 4, 'stagnation_deadband_px': 1.0,
+              'recovery_actions': ['down', 'run_left', 'run_right_jump_long', 'right_jump_short'],
+              'recovery_logit_bias': 8.0}
     reward_objective_migrated = False
     policy_behavior_migrated = False
+    recovery_behavior_migrated = False
     if payload:
         # Preserve learned weights and optimizer while replacing old reward settings.
         saved_config = dict(payload['config'])
         old_reward_version = saved_config.get('reward_version')
         old_left_bias = saved_config.get('left_action_logit_bias')
         old_entropy_coef = saved_config.get('entropy_coef')
+        recovery_keys = ('stagnation_threshold', 'stagnation_deadband_px',
+                         'recovery_actions', 'recovery_logit_bias')
+        recovery_behavior_migrated = any(saved_config.get(key) != config[key] for key in recovery_keys)
         for key in ('movement_reward', 'motion_detector'):
             saved_config.pop(key, None)
         saved_config.update({key: config[key] for key in (
             'reward_scale', 'death_penalty', 'pixels_per_reward', 'progress_clip', 'reward_version',
-            'left_action_logit_bias', 'entropy_coef')})
+            'left_action_logit_bias', 'entropy_coef', 'stagnation_threshold',
+            'stagnation_deadband_px', 'recovery_actions', 'recovery_logit_bias')})
         saved_config.setdefault('gap_bonus', 1.0)
         saved_config.setdefault('gap_detector', 'overworld-rgb-v1')
         reward_objective_migrated = old_reward_version != config['reward_version']
@@ -84,7 +92,8 @@ def main():
     policy = ActorCritic(embeddings, left_action_logit_bias=config['left_action_logit_bias'])
     optimizer = torch.optim.AdamW(policy.parameters(), lr=config['learning_rate'])
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
-             'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0}
+             'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0,
+             'stagnant_decisions': 0}
     if payload:
         policy.load_state_dict(payload['policy'])
         optimizer.load_state_dict(payload['optimizer'])
@@ -136,19 +145,30 @@ def main():
         log.flush()
 
     def state_counts():
-        return {k: state[k] for k in ('frames', 'decisions', 'updates', 'deaths', 'clears', 'gaps')}
+        return {k: state[k] for k in ('frames', 'decisions', 'updates', 'deaths', 'clears', 'gaps',
+                                      'stagnant_decisions')}
 
     def finish(raw, done, bootstrap=0.0, outcome='step'):
         nonlocal active, last_reward, metrics, save_due
         last_reward = raw
+        if outcome in ('death', 'level_clear'):
+            state['stagnant_decisions'] = 0
         if active is not None:
+            if outcome not in ('death', 'level_clear') and (
+                  active['right_progress'] <= config['stagnation_deadband_px'] and
+                  active['gap_bonus'] <= 0):
+                state['stagnant_decisions'] += 1
+            elif outcome not in ('death', 'level_clear'):
+                state['stagnant_decisions'] = 0
             emit('decision_result', decision=state['decisions'], action=ACTIONS[active['action']].name,
                  duration_frames=max(0, state['frames']-active['observed']),
                  displacement_px=round(active['right_progress'], 3), gap_bonus=active['gap_bonus'],
-                 raw_reward=raw, scaled_reward=raw/config['reward_scale'], outcome=outcome)
+                 raw_reward=raw, scaled_reward=raw/config['reward_scale'], outcome=outcome,
+                 recovery_action=active['recovery_action'], stagnant_decisions=state['stagnant_decisions'])
             if args.command == 'train':
                 rollout.append(Transition(active['features'], active['action'], active['log_prob'],
-                                          active['value'], raw/config['reward_scale'], done))
+                                          active['value'], raw/config['reward_scale'], done,
+                                          active['action_bias']))
         active = None
         if len(rollout) >= args.rollout:
             metrics = update(policy, optimizer, rollout, bootstrap,
@@ -166,7 +186,10 @@ def main():
     emit('started', gap_bonus=config['gap_bonus'], reward_objective_migrated=reward_objective_migrated,
          critic_reset_for_reward_migration=bool(args.command == 'train' and payload and reward_objective_migrated),
          policy_behavior_migrated=policy_behavior_migrated,
-         left_action_logit_bias=config['left_action_logit_bias'], entropy_coef=config['entropy_coef'])
+         recovery_behavior_migrated=recovery_behavior_migrated,
+         left_action_logit_bias=config['left_action_logit_bias'], entropy_coef=config['entropy_coef'],
+         stagnation_threshold=config['stagnation_threshold'], recovery_actions=config['recovery_actions'],
+         recovery_logit_bias=config['recovery_logit_bias'])
     print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
     try:
         while args.total_frames is None or state['frames']-start_frames < args.total_frames:
@@ -197,13 +220,25 @@ def main():
                                   death_penalty=config['death_penalty'],
                                   pixels_per_reward=config['pixels_per_reward'],
                                   progress_clip=config['progress_clip']), False, bootstrap)
-                action, log_prob, value, probabilities = policy.act(features, sample=args.command == 'train')
+                recovery_action = None
+                action_bias = None
+                if state['stagnant_decisions'] >= config['stagnation_threshold']:
+                    index = ((state['stagnant_decisions']-config['stagnation_threshold']) %
+                             len(config['recovery_actions']))
+                    recovery_action = config['recovery_actions'][index]
+                    action_bias = torch.zeros(len(ACTIONS))
+                    recovery_index = next(i for i, item in enumerate(ACTIONS) if item.name == recovery_action)
+                    action_bias[recovery_index] = config['recovery_logit_bias']
+                action, log_prob, value, probabilities = policy.act(
+                    features, sample=args.command == 'train', action_bias=action_bias)
                 active = dict(features=features, action=action, log_prob=log_prob, value=value,
-                              commands=ACTIONS[action].commands(), position=0, observed=observation[1], gap_bonus=0.0, right_progress=0.0)
+                              commands=ACTIONS[action].commands(), position=0, observed=observation[1], gap_bonus=0.0,
+                              right_progress=0.0, recovery_action=recovery_action, action_bias=action_bias)
                 policy_frame = observation[2]
                 state['decisions'] += 1
                 emit('decision', action=ACTIONS[action].name, inference_ms=inference_ms,
-                     observation_age_frames=state['frames']-observation[1], value=value)
+                     observation_age_frames=state['frames']-observation[1], value=value,
+                     recovery_action=recovery_action, stagnant_decisions=state['stagnant_decisions'])
             command = ()
             if active is not None:
                 position = active['position']
@@ -249,9 +284,11 @@ def main():
             fps = (state['frames']-start_frames)/elapsed
             dps = (state['decisions']-start_decisions)/elapsed
             if display:
+                recovery = active['recovery_action'] if active and active['recovery_action'] else 'off'
                 lines = [f'{args.command} / {args.mode}', f'FPS {fps:.1f}  decisions/s {dps:.2f}',
                          f'Frame {state["frames"]}', f'Action: {ACTIONS[active["action"]].name if active else "waiting"}',
                          f'Encoder {inference_ms:.1f} ms', f'Input age {state["frames"]-active["observed"] if active else 0} frames',
+                         f'Stagnant decisions {state["stagnant_decisions"]}  recovery {recovery}',
                          f'Rollout {len(rollout)}/{args.rollout}', f'PPO updates {state["updates"]}',
                          f'Dead {state["deaths"]} clear {state["clears"]} gaps {state["gaps"]}', f'Reward {last_reward:g} / {last_reward/config["reward_scale"]:g}',
                          *[f'{k}: {metrics[k]:.4g}' for k in ('policy_loss', 'value_loss', 'entropy', 'explained_variance') if isinstance(metrics.get(k), (float, int))],

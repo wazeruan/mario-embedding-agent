@@ -13,6 +13,7 @@ class Transition:
     value: float
     reward: float
     done: bool
+    action_bias: torch.Tensor | None = None
 
 
 def gae(transitions, bootstrap_value, gamma=0.99, gae_lambda=0.95):
@@ -36,6 +37,11 @@ def update(policy, optimizer, transitions, bootstrap_value, *, epochs=2, minibat
         raise ValueError('Cannot update an empty rollout.')
     features = torch.stack([item.features.detach().clone() for item in transitions])
     actions = torch.tensor([item.action for item in transitions], dtype=torch.long)
+    action_biases = torch.stack([
+        torch.zeros(policy.actor.out_features) if item.action_bias is None
+        else torch.as_tensor(item.action_bias, dtype=torch.float32).detach().clone()
+        for item in transitions
+    ])
     old_logs = torch.tensor([item.log_prob for item in transitions])
     old_values = torch.tensor([item.value for item in transitions])
     advantages, returns = gae(transitions, bootstrap_value, gamma, gae_lambda)
@@ -43,7 +49,7 @@ def update(policy, optimizer, transitions, bootstrap_value, *, epochs=2, minibat
     metrics = {key: [] for key in ('policy_loss', 'value_loss', 'entropy', 'approx_kl', 'clip_fraction')}
     for _ in range(epochs):
         for indices in torch.randperm(len(transitions)).split(minibatch_size):
-            logits, values = policy(features[indices])
+            logits, values = policy(features[indices], action_bias=action_biases[indices])
             dist = Categorical(logits=logits)
             logs = dist.log_prob(actions[indices])
             log_ratio = logs - old_logs[indices]

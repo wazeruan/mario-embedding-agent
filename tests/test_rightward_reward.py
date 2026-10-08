@@ -116,7 +116,8 @@ def test_real_vertical_jump_without_horizontal_input_does_not_earn_rightward_mot
 
 
 @pytest.mark.parametrize('legacy_gap_config', [False, True])
-def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monkeypatch, tmp_path, legacy_gap_config):
+@pytest.mark.parametrize('current_recovery_config', [False, True])
+def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monkeypatch, tmp_path, legacy_gap_config, current_recovery_config):
     import copy
     import json
     import sys
@@ -139,11 +140,15 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     if legacy_gap_config:
         old_config.update(gap_bonus=1., gap_detector='overworld-rgb-v1',
                           movement_reward='rightward', motion_detector='rgb')
+    if current_recovery_config:
+        old_config.update(stagnation_threshold=4, stagnation_deadband_px=1.,
+                          recovery_actions=['down', 'run_left', 'run_right_jump_long', 'right_jump_short'],
+                          recovery_logit_bias=8.)
     payload = {'config': old_config, 'policy': old_policy.state_dict(),
                'optimizer': old_optimizer.state_dict(),
                'training_state': {'frames': 100, 'decisions': 20, 'updates': 5,
                                   'deaths': 2, 'clears': 0, 'episode_seed': 9,
-                                  'episode_commands': [], 'torch_rng_state': torch.get_rng_state()}}
+                                  'episode_commands': [], 'stagnant_decisions': 3, 'torch_rng_state': torch.get_rng_state()}}
 
     class Encoder:
         device = 'cpu'
@@ -183,9 +188,14 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     assert config['gap_bonus'] == 1.
     assert config['left_action_logit_bias'] == -3.
     assert config['entropy_coef'] == .001
+    assert config['stagnation_threshold'] == 4
+    assert config['stagnation_deadband_px'] == 1.
+    assert config['recovery_logit_bias'] == 8.
+    assert config['recovery_actions'] == ['down', 'run_left', 'run_right_jump_long', 'right_jump_short']
     assert 'movement_reward' not in config and 'motion_detector' not in config
     assert state['frames'] == 101 and state['updates'] == 5 and state['deaths'] == 2
     assert state['episode_seed'] == 9
+    assert state['stagnant_decisions'] == 3
     assert torch.equal(weights['actor.bias'], payload['policy']['actor.bias'])
     final_prefix = f'critic.{len(old_policy.critic)-1}.'
     for name, tensor in payload['policy'].items():
@@ -207,3 +217,5 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     assert events[0]['reward_objective_migrated'] is True
     assert events[0]['policy_behavior_migrated'] is True
     assert events[0]['critic_reset_for_reward_migration'] is True
+    assert events[0]['recovery_behavior_migrated'] is (not current_recovery_config)
+    assert events[0]['stagnant_decisions'] == 3

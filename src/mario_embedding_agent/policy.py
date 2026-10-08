@@ -36,14 +36,27 @@ class ActorCritic(nn.Module):
         nn.init.zeros_(self.critic[-1].weight)
         nn.init.zeros_(self.critic[-1].bias)
 
-    def forward(self, features):
+    def forward(self, features, action_bias=None):
         features = F.normalize(features.to(torch.float32), dim=-1)
         logits = self.actor(features) + self.left_action_logit_bias * self.left_action_mask
+        if action_bias is not None:
+            action_bias = torch.as_tensor(action_bias, dtype=logits.dtype, device=logits.device)
+            if logits.ndim == 1:
+                if action_bias.ndim == 2 and action_bias.shape[0] == 1:
+                    action_bias = action_bias[0]
+                if action_bias.shape != logits.shape:
+                    raise ValueError('Action bias must have one value per action.')
+            else:
+                if action_bias.ndim == 1:
+                    action_bias = action_bias.unsqueeze(0)
+                if action_bias.ndim != 2 or action_bias.shape[1] != logits.shape[1] or action_bias.shape[0] not in (1, logits.shape[0]):
+                    raise ValueError('Batched action bias must have shape [actions] or [batch, actions].')
+            logits = logits + action_bias
         return logits, self.critic(features).squeeze(-1)
 
     @torch.no_grad()
-    def act(self, features, sample=True):
-        logits, value = self(features)
+    def act(self, features, sample=True, action_bias=None):
+        logits, value = self(features, action_bias=action_bias)
         distribution = Categorical(logits=logits)
         action = distribution.sample() if sample else logits.argmax(dim=-1)
         return int(action.item()), float(distribution.log_prob(action)), float(value), distribution.probs.tolist()
