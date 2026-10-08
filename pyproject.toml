@@ -30,3 +30,5 @@ dev = [
 
 [project.scripts]
 mario-agent = "mario_embedding_agent.cli:main"
+
+mario-distill = "mario_embedding_agent.distill:main"

@@ -7,7 +7,7 @@ class Display:
     def __init__(self):
         pygame.init()
         self.window = pygame.display.set_mode((1100, 720))
-        pygame.display.set_caption('Mario — frozen EmbeddingGemma-2 + PPO')
+        pygame.display.set_caption('Mario — visual encoder + PPO')
         self.font = pygame.font.SysFont('Menlo', 16)
 
     def draw(self, frame, policy_frame, lines):

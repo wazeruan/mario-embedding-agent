@@ -65,6 +65,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['prepare', 'train', 'play', 'evaluate'])
     parser.add_argument('--device', default='auto')
+    parser.add_argument('--student-encoder', type=Path, help='Distilled image encoder checkpoint; defaults to CPU')
     parser.add_argument('--headless', action='store_true')
     parser.add_argument('--mode', choices=['sync', 'realtime'],
                         help='Emulator pacing; defaults to sync for evaluation and realtime otherwise')
@@ -82,10 +83,16 @@ def main():
         parser.error('fps must be positive, rollout >= 2, total-frames positive')
     if args.command == 'evaluate' and (args.episodes <= 0 or args.total_frames is not None):
         parser.error('evaluate requires positive --episodes and stops only at death, not by frame count')
+    if args.command == 'prepare' and args.student_encoder:
+        parser.error('prepare uses the teacher to encode action texts')
     directory = ROOT/'models/embeddinggemma-2'
     if args.command == 'prepare':
         download_model(directory)
-    encoder = FrozenEncoder(directory, device=args.device)
+    if args.student_encoder:
+        from .student import StudentEncoder
+        encoder = StudentEncoder(args.student_encoder, device=args.device)
+    else:
+        encoder = FrozenEncoder(directory, device=args.device)
     embeddings = prepare_actions(encoder, ROOT/'models/action-embeddings.pt')
     if args.command == 'prepare':
         print(f'Prepared {len(ACTIONS)} actions: {tuple(embeddings.shape)}')
@@ -105,6 +112,8 @@ def main():
               'recovery_logit_bias': 8.0, 'recovery_down_hold_frames': 24,
               'recovery_progress_px': 8.0, 'recovery_progress_window': 4,
               'recovery_progress_events_required': 2, 'recovery_window_net_progress_px': 8.0}
+    config['encoder_backend'] = 'student' if args.student_encoder else 'embeddinggemma2'
+    config['student_fingerprint'] = encoder.fingerprint if args.student_encoder else None
     reward_objective_migrated = False
     policy_behavior_migrated = False
     recovery_behavior_migrated = False
@@ -112,6 +121,8 @@ def main():
     if payload:
         # Preserve learned weights and optimizer while replacing old reward settings.
         saved_config = dict(payload['config'])
+        saved_config.setdefault('encoder_backend', 'embeddinggemma2')
+        saved_config.setdefault('student_fingerprint', None)
         old_reward_version = saved_config.get('reward_version')
         old_left_bias = saved_config.get('left_action_logit_bias')
         old_entropy_coef = saved_config.get('entropy_coef')
@@ -498,7 +509,7 @@ def main():
                 recovery_net = sum(state['recovery_progress_window'])
                 lines = [f'{args.command} / {args.mode}', f'FPS {fps:.1f}  decisions/s {dps:.2f}',
                          f'Frame {state["frames"]}', f'Action: {ACTIONS[active["action"]].name if active else "waiting"}',
-                         f'Encoder {inference_ms:.1f} ms', f'Input age {state["frames"]-active["observed"] if active else 0} frames',
+                         f'{"Student" if args.student_encoder else "Gemma"} {inference_ms:.1f} ms', f'Input age {state["frames"]-active["observed"] if active else 0} frames',
                          f'Stagnant decisions {state["stagnant_decisions"]}',
                          f'Recovery {recovery}  {recovery_evidence}/{config["recovery_progress_events_required"]}  {recovery_net:+.0f}px',
                          f'New ground {frontier.frontier:.0f}px',

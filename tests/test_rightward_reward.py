@@ -198,6 +198,8 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     cli.main()
     config, state, weights, optimizer = saved[-1]
     assert config['reward_scale'] == 50.
+    assert config['encoder_backend'] == 'embeddinggemma2'
+    assert config['student_fingerprint'] is None
     assert config['death_penalty'] == 50.
     assert config['clear_reward'] == 50.
     assert config['ppo_epochs'] == 4
