@@ -32,7 +32,7 @@ class StageDetector:
 
 
 def reward(death, cleared, displacement=0.0, gap_bonus=0.0, *,
-           death_penalty=10.0, pixels_per_reward=8.0, progress_clip=5.0):
+           death_penalty=50.0, pixels_per_reward=8.0, progress_clip=5.0):
     """Signed pixel progress, with terminal outcomes taking precedence."""
     if death:
         return -float(death_penalty)

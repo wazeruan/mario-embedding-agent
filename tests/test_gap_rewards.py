@@ -86,15 +86,17 @@ import pytest
 
 
 @pytest.mark.parametrize(('cross_at', 'death_at', 'expected_rewards', 'expected_gaps', 'motion_value'),
-                         [(2, None, [.1, 0.], 1, 0.),
+                         [(2, None, [.02, 0.], 1, 0.),
                           (6, 8, [0., -1.], 1, 0.),
                           (2, 2, [-1., 0.], 0, 0.),
-                          (2, None, [.13, .03], 1, .6),
-                          (2, None, [.07, -.03], 1, -.6),
-                          (6, 8, [.03, -1.], 1, .6)])
+                          (2, None, [.026, .006], 1, .6),
+                          (2, None, [.014, -.006], 1, -.6),
+                          (6, 8, [.006, -1.], 1, .6),
+                          (6, 'clear', [.006, .02], 1, .6)])
 def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
         monkeypatch, tmp_path, cross_at, death_at, expected_rewards, expected_gaps, motion_value):
     import copy
+    import json
     import sys
     import torch
     from mario_embedding_agent import cli
@@ -116,6 +118,10 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
     class Detector:
         def observe(self, frame):
             return int(frame[0, 0, 0]) == cross_at
+
+    class Stage:
+        def observe(self, frame):
+            return death_at == 'clear' and int(frame[0, 0, 0]) == 8
 
     class Motion:
         def reset(self, frame):
@@ -139,6 +145,7 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
     monkeypatch.setattr(cli, 'prepare_actions', lambda *args: torch.ones(18, 768))
     monkeypatch.setattr(cli, 'make_env', lambda: env)
     monkeypatch.setattr(cli, 'GapDetector', Detector)
+    monkeypatch.setattr(cli, 'StageDetector', Stage)
     monkeypatch.setattr(cli, 'RightwardProgress', Motion)
     monkeypatch.setattr(cli, 'step', fake_step)
     monkeypatch.setattr(cli, 'update', fake_update)
@@ -150,5 +157,18 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
     cli.main()
     assert [item.reward for item in updates[0]] == pytest.approx(expected_rewards)
     assert saved[-1]['gaps'] == expected_gaps
-    if death_at is not None:
+    events = [json.loads(line) for line in (tmp_path/'runs/train.jsonl').read_text().splitlines()]
+    results = [event for event in events if event['event'] == 'decision_result']
+    assert [event['scaled_reward'] for event in results[:2]] == pytest.approx(expected_rewards)
+    assert all(event['action'] == 'idle' for event in results)
+    assert all(event['duration_frames'] > 0 for event in results)
+    assert all(event['raw_reward']/50 == pytest.approx(event['scaled_reward']) for event in results)
+    if death_at == 'clear':
+        clear_events = [event for event in results if event['outcome'] == 'level_clear']
+        assert len(clear_events) == 1 and clear_events[0]['raw_reward'] == 1.
+        assert any(item.done and item.reward == .02 for item in updates[0])
+    elif death_at is not None:
+        death_events = [event for event in results if event['outcome'] == 'death']
+        assert len(death_events) == 1 and death_events[0]['raw_reward'] == -50.
+    if death_at is not None and death_at != 'clear':
         assert any(item.done and item.reward == -1. for item in updates[0])

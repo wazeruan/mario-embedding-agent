@@ -45,9 +45,9 @@ def test_missing_sprite_contributes_no_guessed_displacement():
                           (False, False, -1., 0., 0.),
                           (False, False, 80., 0., 5.),
                           (False, False, -80., 0., -5.),
-                          (True, False, 8., 1., -10.),
+                          (True, False, 8., 1., -50.),
                           (False, True, 8., 1., 1.),
-                          (True, True, 8., 1., -10.)])
+                          (True, True, 8., 1., -50.)])
 def test_signed_reward_deadband_clip_and_terminal_override(death, cleared, displacement, bonus, expected):
     assert reward(death, cleared, displacement, bonus) == expected
 
@@ -127,8 +127,15 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     with torch.no_grad():
         old_policy.actor.bias.fill_(.42)
     old_optimizer = torch.optim.AdamW(old_policy.parameters(), lr=3e-4)
-    old_config = {'reward_scale': 1000., 'image_tokens': 70, 'seed': 7,
-                  'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4}
+    # Populate Adam moments for actor and critic, including nonzero value output.
+    for parameter in old_policy.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    old_optimizer.step()
+    old_optimizer.zero_grad(set_to_none=True)
+    old_config = {'reward_scale': 10., 'image_tokens': 70, 'seed': 7,
+                  'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
+                  'death_penalty': 10., 'pixels_per_reward': 8.,
+                  'progress_clip': 5., 'reward_version': 'signed-progress-v1'}
     if legacy_gap_config:
         old_config.update(gap_bonus=1., gap_detector='overworld-rgb-v1',
                           movement_reward='rightward', motion_detector='rgb')
@@ -168,11 +175,11 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
                                     '--total-frames', '1', '--resume', 'legacy.pt'])
     cli.main()
     config, state, weights, optimizer = saved[-1]
-    assert config['reward_scale'] == 10.
-    assert config['death_penalty'] == 10.
+    assert config['reward_scale'] == 50.
+    assert config['death_penalty'] == 50.
     assert config['pixels_per_reward'] == 8.
     assert config['progress_clip'] == 5.
-    assert config['reward_version'] == 'signed-progress-v1'
+    assert config['reward_version'] == 'signed-progress-v2'
     assert config['gap_bonus'] == 1.
     assert config['left_action_logit_bias'] == -3.
     assert config['entropy_coef'] == .001
@@ -180,8 +187,23 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     assert state['frames'] == 101 and state['updates'] == 5 and state['deaths'] == 2
     assert state['episode_seed'] == 9
     assert torch.equal(weights['actor.bias'], payload['policy']['actor.bias'])
-    assert optimizer == payload['optimizer']
+    final_prefix = f'critic.{len(old_policy.critic)-1}.'
+    for name, tensor in payload['policy'].items():
+        if name.startswith(final_prefix):
+            assert torch.count_nonzero(weights[name]) == 0
+            assert torch.count_nonzero(tensor) > 0
+        else:
+            torch.testing.assert_close(weights[name], tensor)
+    old_ids = payload['optimizer']['param_groups'][0]['params']
+    actor_ids = [index for index, (name, _) in zip(old_ids, old_policy.named_parameters())
+                 if name.startswith('actor.')]
+    assert set(optimizer['state']) == set(actor_ids)
+    assert optimizer['param_groups'] == payload['optimizer']['param_groups']
+    for index in actor_ids:
+        for name, value in payload['optimizer']['state'][index].items():
+            torch.testing.assert_close(optimizer['state'][index][name], value)
     events = [json.loads(line) for line in (tmp_path/'runs/train.jsonl').read_text().splitlines()]
     assert events[0]['event'] == 'started'
     assert events[0]['reward_objective_migrated'] is True
     assert events[0]['policy_behavior_migrated'] is True
+    assert events[0]['critic_reset_for_reward_migration'] is True

@@ -19,6 +19,15 @@ from .display import Display
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def reset_critic_value_scale(policy, optimizer):
+    """Keep learned critic features but clear value output and stale Adam moments."""
+    with torch.no_grad():
+        policy.critic[-1].weight.zero_()
+        policy.critic[-1].bias.zero_()
+    for parameter in policy.critic.parameters():
+        optimizer.state.pop(parameter, None)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['prepare', 'train', 'play'])
@@ -43,11 +52,11 @@ def main():
         print(f'Prepared {len(ACTIONS)} actions: {tuple(embeddings.shape)}')
         return
     payload = checkpoint.load(args.resume or args.checkpoint) if args.resume or args.command == 'play' else None
-    config = {'reward_scale': 10.0, 'image_tokens': 70, 'seed': args.seed,
+    config = {'reward_scale': 50.0, 'image_tokens': 70, 'seed': args.seed,
               'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
-              'death_penalty': 10.0, 'pixels_per_reward': 8.0,
-              'progress_clip': 5.0, 'reward_version': 'signed-progress-v1',
+              'death_penalty': 50.0, 'pixels_per_reward': 8.0,
+              'progress_clip': 5.0, 'reward_version': 'signed-progress-v2',
               'left_action_logit_bias': -3.0, 'entropy_coef': 0.001}
     reward_objective_migrated = False
     policy_behavior_migrated = False
@@ -79,6 +88,8 @@ def main():
     if payload:
         policy.load_state_dict(payload['policy'])
         optimizer.load_state_dict(payload['optimizer'])
+        if args.command == 'train' and reward_objective_migrated:
+            reset_critic_value_scale(policy, optimizer)
         state.update({k: v for k, v in payload['training_state'].items() if k != 'torch_rng_state'})
         torch.set_rng_state(payload['training_state']['torch_rng_state'])
     env = make_env()
@@ -127,12 +138,17 @@ def main():
     def state_counts():
         return {k: state[k] for k in ('frames', 'decisions', 'updates', 'deaths', 'clears', 'gaps')}
 
-    def finish(raw, done, bootstrap=0.0):
+    def finish(raw, done, bootstrap=0.0, outcome='step'):
         nonlocal active, last_reward, metrics, save_due
         last_reward = raw
-        if active is not None and args.command == 'train':
-            rollout.append(Transition(active['features'], active['action'], active['log_prob'],
-                                      active['value'], raw/config['reward_scale'], done))
+        if active is not None:
+            emit('decision_result', decision=state['decisions'], action=ACTIONS[active['action']].name,
+                 duration_frames=max(0, state['frames']-active['observed']),
+                 displacement_px=round(active['right_progress'], 3), gap_bonus=active['gap_bonus'],
+                 raw_reward=raw, scaled_reward=raw/config['reward_scale'], outcome=outcome)
+            if args.command == 'train':
+                rollout.append(Transition(active['features'], active['action'], active['log_prob'],
+                                          active['value'], raw/config['reward_scale'], done))
         active = None
         if len(rollout) >= args.rollout:
             metrics = update(policy, optimizer, rollout, bootstrap,
@@ -148,6 +164,7 @@ def main():
         return features, (time.perf_counter()-before)*1000
 
     emit('started', gap_bonus=config['gap_bonus'], reward_objective_migrated=reward_objective_migrated,
+         critic_reset_for_reward_migration=bool(args.command == 'train' and payload and reward_objective_migrated),
          policy_behavior_migrated=policy_behavior_migrated,
          left_action_logit_bias=config['left_action_logit_bias'], entropy_coef=config['entropy_coef'])
     print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
@@ -210,7 +227,8 @@ def main():
                 outcome = 'death' if died else 'clear'
                 image_path = logdir/f'{outcome}-{state["frames"]}.png'
                 Image.fromarray(frame).save(image_path)
-                finish(reward(died, cleared, death_penalty=config['death_penalty']), True)
+                finish(reward(died, cleared, death_penalty=config['death_penalty']), True,
+                       outcome='death' if died else 'level_clear')
                 state['deaths' if died else 'clears'] += 1
                 emit(outcome, raw_reward=last_reward, captured_frame=str(image_path))
                 generation += 1

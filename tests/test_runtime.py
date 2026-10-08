@@ -28,8 +28,8 @@ def test_pixel_level_detector_requires_stable_new_label_and_no_duplicates():
 
 
 @pytest.mark.parametrize(('death', 'clear', 'expected'),
-                         [(False, False, 0.), (True, False, -10.),
-                          (False, True, 1.), (True, True, -10.)])
+                         [(False, False, 0.), (True, False, -50.),
+                          (False, True, 1.), (True, True, -50.)])
 def test_terminal_reward_overrides_shaping(death, clear, expected):
     assert reward(death, clear) == expected
 
