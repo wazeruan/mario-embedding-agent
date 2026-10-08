@@ -35,16 +35,27 @@ def test_missing_sprite_contributes_no_guessed_displacement():
     assert motion.observe(overworld(70)) == 0.
 
 
-@pytest.mark.parametrize(('death', 'cleared', 'moving', 'bonus', 'expected'),
-                         [(False, False, False, 0., 0.),
-                          (False, False, True, 0., 1.),
-                          (False, False, True, 1., 2.),
-                          (False, False, False, 1., 1.),
-                          (True, False, True, 1., -1000.),
-                          (False, True, True, 1., 1.),
-                          (True, True, True, 1., -1000.)])
-def test_reward_no_decision_cost_and_terminal_override(death, cleared, moving, bonus, expected):
-    assert reward(death, cleared, moving, bonus) == expected
+@pytest.mark.parametrize(('death', 'cleared', 'displacement', 'bonus', 'expected'),
+                         [(False, False, 0., 0., 0.),
+                          (False, False, 8., 0., 1.),
+                          (False, False, -8., 0., -1.),
+                          (False, False, 8., 1., 2.),
+                          (False, False, 0., 1., 1.),
+                          (False, False, 1., 0., 0.),
+                          (False, False, -1., 0., 0.),
+                          (False, False, 80., 0., 5.),
+                          (False, False, -80., 0., -5.),
+                          (True, False, 8., 1., -10.),
+                          (False, True, 8., 1., 1.),
+                          (True, True, 8., 1., -10.)])
+def test_signed_reward_deadband_clip_and_terminal_override(death, cleared, displacement, bonus, expected):
+    assert reward(death, cleared, displacement, bonus) == expected
+
+
+def test_signed_progress_does_not_reward_equal_right_left_oscillation():
+    assert sum(reward(False, False, pixels) for pixels in [8., -8., 16., -16.]) == 0.
+    assert reward(False, False, 0.) == 0.
+    assert reward(True, False, 8., death_penalty=20.) == -20.
 
 
 def test_real_pixel_only_stationary_right_left_and_camera_scroll():
@@ -102,3 +113,72 @@ def test_real_vertical_jump_without_horizontal_input_does_not_earn_rightward_mot
         assert sum(progress) <= 1.0
     finally:
         env.close()
+
+
+@pytest.mark.parametrize('legacy_gap_config', [False, True])
+def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monkeypatch, tmp_path, legacy_gap_config):
+    import copy
+    import json
+    import sys
+    import torch
+    from mario_embedding_agent import cli
+
+    old_policy = cli.ActorCritic(torch.ones(18, 768))
+    with torch.no_grad():
+        old_policy.actor.bias.fill_(.42)
+    old_optimizer = torch.optim.AdamW(old_policy.parameters(), lr=3e-4)
+    old_config = {'reward_scale': 1000., 'image_tokens': 70, 'seed': 7,
+                  'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4}
+    if legacy_gap_config:
+        old_config.update(gap_bonus=1., gap_detector='overworld-rgb-v1',
+                          movement_reward='rightward', motion_detector='rgb')
+    payload = {'config': old_config, 'policy': old_policy.state_dict(),
+               'optimizer': old_optimizer.state_dict(),
+               'training_state': {'frames': 100, 'decisions': 20, 'updates': 5,
+                                  'deaths': 2, 'clears': 0, 'episode_seed': 9,
+                                  'episode_commands': [], 'torch_rng_state': torch.get_rng_state()}}
+
+    class Encoder:
+        device = 'cpu'
+        def __init__(self, *args, **kwargs):
+            pass
+        def encode_frame(self, frame):
+            return torch.ones(768)
+
+    class Env:
+        def reset(self, seed):
+            assert seed == 9
+            return np.zeros((240, 256, 3), dtype=np.uint8), {}
+        def close(self):
+            pass
+
+    saved = []
+    def save(path, policy, optimizer, config, state):
+        saved.append((copy.deepcopy(config), copy.deepcopy(state),
+                      copy.deepcopy(policy.state_dict()), copy.deepcopy(optimizer.state_dict())))
+    monkeypatch.setattr(cli, 'ROOT', tmp_path)
+    monkeypatch.setattr(cli, 'FrozenEncoder', Encoder)
+    monkeypatch.setattr(cli, 'prepare_actions', lambda *args: torch.ones(18, 768))
+    monkeypatch.setattr(cli, 'make_env', Env)
+    monkeypatch.setattr(cli, 'step', lambda *args: (np.zeros((240, 256, 3), dtype=np.uint8), False))
+    monkeypatch.setattr(cli.checkpoint, 'load', lambda path: payload)
+    monkeypatch.setattr(cli.checkpoint, 'save', save)
+    monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync',
+                                    '--total-frames', '1', '--resume', 'legacy.pt'])
+    cli.main()
+    config, state, weights, optimizer = saved[-1]
+    assert config['reward_scale'] == 10.
+    assert config['death_penalty'] == 10.
+    assert config['pixels_per_reward'] == 8.
+    assert config['progress_clip'] == 5.
+    assert config['reward_version'] == 'signed-progress-v1'
+    assert config['gap_bonus'] == 1.
+    assert 'movement_reward' not in config and 'motion_detector' not in config
+    assert state['frames'] == 101 and state['updates'] == 5 and state['deaths'] == 2
+    assert state['episode_seed'] == 9
+    assert torch.equal(weights['actor.bias'], payload['policy']['actor.bias'])
+    assert optimizer == payload['optimizer']
+    events = [json.loads(line) for line in (tmp_path/'runs/train.jsonl').read_text().splitlines()]
+    assert events[0]['event'] == 'started'
+    assert events[0]['reward_objective_migrated'] is True

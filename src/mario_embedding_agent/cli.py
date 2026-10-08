@@ -43,17 +43,23 @@ def main():
         print(f'Prepared {len(ACTIONS)} actions: {tuple(embeddings.shape)}')
         return
     payload = checkpoint.load(args.resume or args.checkpoint) if args.resume or args.command == 'play' else None
-    config = {'reward_scale': 1000.0, 'image_tokens': 70, 'seed': args.seed,
+    config = {'reward_scale': 10.0, 'image_tokens': 70, 'seed': args.seed,
               'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
-              'movement_reward': 1.0, 'motion_detector': 'rgb-world-displacement-v1'}
+              'death_penalty': 10.0, 'pixels_per_reward': 8.0,
+              'progress_clip': 5.0, 'reward_version': 'signed-progress-v1'}
+    reward_objective_migrated = False
     if payload:
-        # Old checkpoints retain weights/optimizer; explicitly log objective migration.
+        # Preserve learned weights and optimizer while replacing old reward settings.
         saved_config = dict(payload['config'])
+        old_reward_version = saved_config.get('reward_version')
+        for key in ('movement_reward', 'motion_detector'):
+            saved_config.pop(key, None)
+        saved_config.update({key: config[key] for key in (
+            'reward_scale', 'death_penalty', 'pixels_per_reward', 'progress_clip', 'reward_version')})
         saved_config.setdefault('gap_bonus', 1.0)
         saved_config.setdefault('gap_detector', 'overworld-rgb-v1')
-        saved_config.setdefault('movement_reward', 1.0)
-        saved_config.setdefault('motion_detector', 'rgb-world-displacement-v1')
+        reward_objective_migrated = old_reward_version != config['reward_version']
         if {k: v for k, v in saved_config.items() if k != 'seed'} != {k: v for k, v in config.items() if k != 'seed'}:
             raise ValueError('Checkpoint training configuration is incompatible')
         config = saved_config
@@ -119,7 +125,7 @@ def main():
         last_reward = raw
         if active is not None and args.command == 'train':
             rollout.append(Transition(active['features'], active['action'], active['log_prob'],
-                                      active['value'], raw/1000, done))
+                                      active['value'], raw/config['reward_scale'], done))
         active = None
         if len(rollout) >= args.rollout:
             metrics = update(policy, optimizer, rollout, bootstrap)
@@ -133,7 +139,7 @@ def main():
         features = encoder.encode_frame(image)
         return features, (time.perf_counter()-before)*1000
 
-    emit('started', gap_bonus=config['gap_bonus'], reward_objective_migrated=bool(payload and ('movement_reward' not in payload['config'] or 'gap_bonus' not in payload['config'])))
+    emit('started', gap_bonus=config['gap_bonus'], reward_objective_migrated=reward_objective_migrated)
     print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
     try:
         while args.total_frames is None or state['frames']-start_frames < args.total_frames:
@@ -160,7 +166,10 @@ def main():
                 with torch.no_grad():
                     bootstrap = float(policy(features)[1])
                 if active is not None:
-                    finish(reward(False, False, active['right_progress'] > 1.0, active['gap_bonus']), False, bootstrap)
+                    finish(reward(False, False, active['right_progress'], active['gap_bonus'],
+                                  death_penalty=config['death_penalty'],
+                                  pixels_per_reward=config['pixels_per_reward'],
+                                  progress_clip=config['progress_clip']), False, bootstrap)
                 action, log_prob, value, probabilities = policy.act(features, sample=args.command == 'train')
                 active = dict(features=features, action=action, log_prob=log_prob, value=value,
                               commands=ACTIONS[action].commands(), position=0, observed=observation[1], gap_bonus=0.0, right_progress=0.0)
@@ -191,7 +200,7 @@ def main():
                 outcome = 'death' if died else 'clear'
                 image_path = logdir/f'{outcome}-{state["frames"]}.png'
                 Image.fromarray(frame).save(image_path)
-                finish(reward(died, cleared), True)
+                finish(reward(died, cleared, death_penalty=config['death_penalty']), True)
                 state['deaths' if died else 'clears'] += 1
                 emit(outcome, raw_reward=last_reward, captured_frame=str(image_path))
                 generation += 1
@@ -216,7 +225,7 @@ def main():
                          f'Frame {state["frames"]}', f'Action: {ACTIONS[active["action"]].name if active else "waiting"}',
                          f'Encoder {inference_ms:.1f} ms', f'Input age {state["frames"]-active["observed"] if active else 0} frames',
                          f'Rollout {len(rollout)}/{args.rollout}', f'PPO updates {state["updates"]}',
-                         f'Dead {state["deaths"]} clear {state["clears"]} gaps {state["gaps"]}', f'Reward {last_reward:g} / {last_reward/1000:g}',
+                         f'Dead {state["deaths"]} clear {state["clears"]} gaps {state["gaps"]}', f'Reward {last_reward:g} / {last_reward/config["reward_scale"]:g}',
                          *[f'{k}: {metrics[k]:.4g}' for k in ('policy_loss', 'value_loss', 'entropy', 'explained_variance') if isinstance(metrics.get(k), (float, int))],
                          'Top action probabilities:',
                          *[f'{ACTIONS[i].name}: {probabilities[i]:.2f}' for i in sorted(range(len(probabilities)), key=lambda i: probabilities[i], reverse=True)[:3]],

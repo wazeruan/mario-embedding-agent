@@ -86,12 +86,12 @@ import pytest
 
 
 @pytest.mark.parametrize(('cross_at', 'death_at', 'expected_rewards', 'expected_gaps', 'motion_value'),
-                         [(2, None, [.001, 0.], 1, 0.),
+                         [(2, None, [.1, 0.], 1, 0.),
                           (6, 8, [0., -1.], 1, 0.),
                           (2, 2, [-1., 0.], 0, 0.),
-                          (2, None, [.002, .001], 1, .6),
-                          (2, None, [.001, 0.], 1, -.6),
-                          (6, 8, [.001, -1.], 1, .6)])
+                          (2, None, [.13, .03], 1, .6),
+                          (2, None, [.07, -.03], 1, -.6),
+                          (6, 8, [.03, -1.], 1, .6)])
 def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
         monkeypatch, tmp_path, cross_at, death_at, expected_rewards, expected_gaps, motion_value):
     import copy
@@ -147,7 +147,7 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
     monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync',
                                     '--total-frames', '10', '--rollout', '2'])
     cli.main()
-    assert [item.reward for item in updates[0]] == expected_rewards
+    assert [item.reward for item in updates[0]] == pytest.approx(expected_rewards)
     assert saved[-1]['gaps'] == expected_gaps
     if death_at is not None:
         assert any(item.done and item.reward == -1. for item in updates[0])

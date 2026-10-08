@@ -31,9 +31,18 @@ class StageDetector:
         return False
 
 
-def reward(death, cleared, moved_right=False, gap_bonus=0.0):
-    """Raw reward: terminal outcomes override movement and shaping rewards."""
-    return -1000.0 if death else 1.0 if cleared else float(bool(moved_right)) + float(gap_bonus)
+def reward(death, cleared, displacement=0.0, gap_bonus=0.0, *,
+           death_penalty=10.0, pixels_per_reward=8.0, progress_clip=5.0):
+    """Signed pixel progress, with terminal outcomes taking precedence."""
+    if death:
+        return -float(death_penalty)
+    if cleared:
+        return 1.0
+    pixels = float(displacement)
+    if abs(pixels) <= 1.0:
+        pixels = 0.0  # Suppress subpixel sprite jitter.
+    progress = np.clip(pixels / pixels_per_reward, -progress_clip, progress_clip)
+    return float(progress) + float(gap_bonus)
 
 
 class GapDetector:
