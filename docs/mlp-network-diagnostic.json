@@ -1,0 +1,49 @@
+{
+  "heldout_frames": 255,
+  "feature_mean_coordinate_std": 0.0021493954118341208,
+  "gameplay_improvement_proven": false,
+  "comparability_limit": "Different training histories; one bounded sync pilot does not prove gameplay improvement. Head timings exclude encoder.",
+  "standardized_current_mean_coordinate_std": 0.9790678024291992,
+  "scaled_delta_mean_coordinate_std": 0.41902485489845276,
+  "pilot": {
+    "frames": 10000,
+    "decisions": 833,
+    "updates": 52,
+    "deaths": 19,
+    "clears": 0,
+    "gaps": 3,
+    "nonlinear_actor_output_weight_norm": 0.3461180627346039,
+    "joint_critic_output_weight_norm": 0.023914551362395287,
+    "student_fingerprint": "552f2443855995ec6e5cd4b54e88accfea53a107701517f762b0bd0d4cb43218",
+    "encoder_median_ms": 2.016875019762665,
+    "encoder_p95_ms": 2.7076665661297734,
+    "logged_ppo_updates": 52,
+    "complete_10000_frame_budget": true
+  },
+  "heads": {
+    "legacy": {
+      "checkpoint": "checkpoints/student-pipe-v1-scratch.pt",
+      "architecture": "legacy",
+      "probability_mean_coordinate_std": 0.00034773751394823194,
+      "value_sd": 0.035644713789224625,
+      "policy_act_cpu_1thread_median_ms": 0.08110402268357575,
+      "policy_act_cpu_1thread_p95_ms": 0.09301253594458102
+    },
+    "mlp": {
+      "checkpoint": "checkpoints/mlp-diagnostic.pt",
+      "architecture": "mlp",
+      "probability_mean_coordinate_std": 0.044664476066827774,
+      "value_sd": 0.22795173525810242,
+      "policy_act_cpu_1thread_median_ms": 0.13108301209285855,
+      "policy_act_cpu_1thread_p95_ms": 0.13580690720118582
+    }
+  },
+  "prediction_variation_ratios": {
+    "probability_std_ratio": 128.44307638743004,
+    "value_sd_ratio": 6.395106343286507
+  },
+  "previous_context_policy": {
+    "reset_to_current_at_group_change": true,
+    "group_boundaries_including_first": 5
+  }
+}

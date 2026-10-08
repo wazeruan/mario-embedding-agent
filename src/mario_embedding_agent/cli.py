@@ -23,11 +23,14 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def reset_critic_value_scale(policy, optimizer):
     """Keep learned critic features but clear value output and stale Adam moments."""
+    critics = [policy.critic, policy.temporal_critic]
+    if hasattr(policy, 'joint_critic'):
+        critics.append(policy.joint_critic)
     with torch.no_grad():
-        for critic in (policy.critic, policy.temporal_critic):
+        for critic in critics:
             critic[-1].weight.zero_()
             critic[-1].bias.zero_()
-    for critic in (policy.critic, policy.temporal_critic):
+    for critic in critics:
         for parameter in critic.parameters():
             optimizer.state.pop(parameter, None)
 
@@ -66,6 +69,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['prepare', 'train', 'play', 'evaluate'])
     parser.add_argument('--device', default='auto')
+    parser.add_argument('--policy-architecture', choices=['legacy', 'mlp'], help='Fresh runs default to mlp; resumes keep the saved architecture')
     parser.add_argument('--student-encoder', type=Path, help='Distilled image encoder checkpoint; defaults to CPU')
     parser.add_argument('--headless', action='store_true')
     parser.add_argument('--mode', choices=['sync', 'realtime'],
@@ -99,6 +103,7 @@ def main():
         print(f'Prepared {len(ACTIONS)} actions: {tuple(embeddings.shape)}')
         return
     payload = checkpoint.load(args.resume or args.checkpoint) if args.resume or args.command in ('play', 'evaluate') else None
+    architecture = args.policy_architecture or (payload['config'].get('policy_architecture', 'legacy') if payload else 'mlp')
     config = {'reward_scale': 50.0, 'image_tokens': 70, 'seed': args.seed,
               'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
@@ -113,6 +118,8 @@ def main():
               'recovery_logit_bias': 8.0, 'recovery_down_hold_frames': 24,
               'recovery_progress_px': 8.0, 'recovery_progress_window': 4,
               'recovery_progress_events_required': 2, 'recovery_window_net_progress_px': 8.0, 'pipe_recovery': 'rgb-side-entry-v1'}
+    config['policy_architecture'] = architecture
+    config['feature_standardization'] = 'student-output-train-stats-v1' if architecture == 'mlp' and args.student_encoder else 'identity'
     config['encoder_backend'] = 'student' if args.student_encoder else 'embeddinggemma2'
     config['student_fingerprint'] = encoder.fingerprint if args.student_encoder else None
     reward_objective_migrated = False
@@ -122,6 +129,8 @@ def main():
     if payload:
         # Preserve learned weights and optimizer while replacing old reward settings.
         saved_config = dict(payload['config'])
+        saved_config.setdefault('policy_architecture', 'legacy')
+        saved_config.setdefault('feature_standardization', 'identity')
         saved_config.setdefault('encoder_backend', 'embeddinggemma2')
         saved_config.setdefault('student_fingerprint', None)
         old_reward_version = saved_config.get('reward_version')
@@ -155,7 +164,18 @@ def main():
         config = saved_config
     torch.set_num_threads(1)
     torch.manual_seed(config['seed'])
-    policy = ActorCritic(embeddings, left_action_logit_bias=config['left_action_logit_bias'])
+    policy_kwargs = {}
+    if architecture == 'mlp':
+        policy_kwargs['architecture'] = 'mlp'
+        if args.student_encoder:
+            if payload:
+                mean, std = payload['policy']['feature_mean'], payload['policy']['feature_std']
+            else:
+                from .student import calibrate_policy_features
+                print('Calibrating policy inputs on training-stream student outputs...', flush=True)
+                mean, std = calibrate_policy_features(encoder, ROOT/'models/distillation/frames.pt')
+            policy_kwargs.update(feature_mean=mean, feature_std=std)
+    policy = ActorCritic(embeddings, left_action_logit_bias=config['left_action_logit_bias'], **policy_kwargs)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=config['learning_rate'],
                                  weight_decay=config['optimizer_weight_decay'])
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
@@ -342,7 +362,7 @@ def main():
         features = encoder.encode_frame(image)
         return features, (time.perf_counter()-before)*1000
 
-    emit('started', mode=args.mode, gap_bonus=config['gap_bonus'], reward_objective_migrated=reward_objective_migrated,
+    emit('started', mode=args.mode, policy_architecture=architecture, feature_standardization=config['feature_standardization'], gap_bonus=config['gap_bonus'], reward_objective_migrated=reward_objective_migrated,
          reward_version=config['reward_version'], clear_reward=config['clear_reward'],
          pixels_per_reward=config['pixels_per_reward'], ppo_epochs=config['ppo_epochs'],
          target_kl=config['target_kl'], discount_reference_frames=config['discount_reference_frames'],
@@ -359,7 +379,7 @@ def main():
          recovery_progress_events_required=config['recovery_progress_events_required'],
          recovery_window_net_progress_px=config['recovery_window_net_progress_px'])
     print(f'{args.command}: {len(ACTIONS)} actions; mode={args.mode}; temporal=embedding delta; '
-          f'PPO rollout={args.rollout}; encoder={encoder.device}', flush=True)
+          f'PPO rollout={args.rollout}; encoder={encoder.device}; policy={architecture}', flush=True)
     try:
         while (not stop_evaluation and
                (args.total_frames is None or state['frames']-start_frames < args.total_frames)):
@@ -514,7 +534,7 @@ def main():
                 recovery_evidence = sum(value >= config['recovery_progress_px']
                                         for value in state['recovery_progress_window'])
                 recovery_net = sum(state['recovery_progress_window'])
-                lines = [f'{args.command} / {args.mode}', f'FPS {fps:.1f}  decisions/s {dps:.2f}',
+                lines = [f'{args.command} / {args.mode} / {architecture}', f'FPS {fps:.1f}  decisions/s {dps:.2f}',
                          f'Frame {state["frames"]}', f'Action: {ACTIONS[active["action"]].name if active else "waiting"}',
                          f'{"Student" if args.student_encoder else "Gemma"} {inference_ms:.1f} ms', f'Input age {state["frames"]-active["observed"] if active else 0} frames',
                          f'Stagnant decisions {state["stagnant_decisions"]}',

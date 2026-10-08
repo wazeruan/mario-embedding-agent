@@ -68,3 +68,11 @@ class StudentEncoder:
 
     def encode_actions(self):
         raise ValueError('Student is image-only. Run mario-agent prepare with the teacher first.')
+
+
+def calibrate_policy_features(encoder, data_path):
+    """Measure normalized student outputs on training streams only, once before PPO."""
+    from .distill import load_data
+    data, train_mask, _ = load_data(data_path)
+    features = torch.stack([encoder.encode_frame(frame.numpy()) for frame in data['frames'][train_mask]])
+    return features.mean(0), features.std(0).clamp_min(1e-3)

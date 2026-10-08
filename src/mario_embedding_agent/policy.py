@@ -1,4 +1,4 @@
-"""A direct trainable action projection and independent nonlinear value head."""
+"""Pre-encoded action prior with optional nonlinear, standardized visual heads."""
 import math
 import torch
 from torch import nn
@@ -8,8 +8,16 @@ from .actions import ACTIONS
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, action_embeddings, temperature=0.2, left_action_logit_bias=-3.0):
+    def __init__(self, action_embeddings, temperature=0.2, left_action_logit_bias=-3.0,
+                 architecture="legacy", feature_mean=None, feature_std=None):
         super().__init__()
+        if architecture not in ('legacy', 'mlp'):
+            raise ValueError('Unknown policy architecture.')
+        self.architecture = architecture
+        if (feature_mean is None) != (feature_std is None):
+            raise ValueError('Feature mean and standard deviation must be provided together.')
+        if architecture == 'legacy' and feature_mean is not None:
+            raise ValueError('Legacy architecture does not use feature statistics.')
         vectors = torch.as_tensor(action_embeddings, dtype=torch.float32).detach().clone()
         if vectors.ndim != 2 or vectors.shape[1] != 768 or not torch.isfinite(vectors).all() or (vectors.norm(dim=1) == 0).any():
             raise ValueError('Expected finite nonzero action vectors with shape [actions,768].')
@@ -45,6 +53,30 @@ class ActorCritic(nn.Module):
         nn.init.zeros_(self.temporal_critic[-1].weight)
         nn.init.zeros_(self.temporal_critic[-1].bias)
 
+        if architecture == 'mlp':
+            mean = torch.zeros(768) if feature_mean is None else torch.as_tensor(feature_mean, dtype=torch.float32).detach().clone()
+            std = torch.ones(768) if feature_std is None else torch.as_tensor(feature_std, dtype=torch.float32).detach().clone()
+            if mean.shape != (768,) or std.shape != (768,) or not torch.isfinite(mean).all() or not torch.isfinite(std).all() or (std <= 0).any():
+                raise ValueError('Expected finite 768-dimensional feature statistics with positive standard deviations.')
+            self.register_buffer('feature_mean', mean)
+            self.register_buffer('feature_std', std.clamp_min(1e-3))
+            self.nonlinear_actor = nn.Sequential(nn.LayerNorm(1536), nn.Linear(1536, 256), nn.GELU(),
+                                               nn.Linear(256, 128), nn.GELU(), nn.Linear(128, len(vectors)))
+            self.joint_critic = nn.Sequential(nn.LayerNorm(1536), nn.Linear(1536, 128), nn.GELU(),
+                                             nn.Linear(128, 64), nn.GELU(), nn.Linear(64, 1))
+            for layer in self.nonlinear_actor:
+                if isinstance(layer, nn.Linear):
+                    nn.init.orthogonal_(layer.weight, gain=math.sqrt(2))
+                    nn.init.zeros_(layer.bias)
+            # Preserve the action prior at initialization; PPO learns its correction.
+            nn.init.zeros_(self.nonlinear_actor[-1].weight)
+            for head in (self.critic, self.temporal_critic, self.joint_critic):
+                for layer in head:
+                    if isinstance(layer, nn.Linear):
+                        nn.init.orthogonal_(layer.weight, gain=math.sqrt(2))
+                        nn.init.zeros_(layer.bias)
+                nn.init.zeros_(head[-1].weight)
+
     def forward(self, features, action_bias=None, *, previous_features=None):
         features = F.normalize(features.to(torch.float32), dim=-1)
         if previous_features is None:
@@ -56,6 +88,12 @@ class ActorCritic(nn.Module):
             temporal_delta = features - F.normalize(previous_features, dim=-1)
         logits = (self.actor(features) + self.temporal_actor(temporal_delta) +
                   self.left_action_logit_bias * self.left_action_mask)
+        value_features = features
+        value_delta = temporal_delta
+        if self.architecture == 'mlp':
+            value_features = ((features-self.feature_mean)/self.feature_std).clamp(-10, 10)
+            value_delta = (temporal_delta/self.feature_std).clamp(-10, 10)
+            logits = logits + self.nonlinear_actor(torch.cat((value_features, value_delta), dim=-1))
         if action_bias is not None:
             action_bias = torch.as_tensor(action_bias, dtype=logits.dtype, device=logits.device)
             if logits.ndim == 1:
@@ -69,7 +107,9 @@ class ActorCritic(nn.Module):
                 if action_bias.ndim != 2 or action_bias.shape[1] != logits.shape[1] or action_bias.shape[0] not in (1, logits.shape[0]):
                     raise ValueError('Batched action bias must have shape [actions] or [batch, actions].')
             logits = logits + action_bias
-        values = self.critic(features).squeeze(-1) + self.temporal_critic(temporal_delta).squeeze(-1)
+        values = self.critic(value_features).squeeze(-1) + self.temporal_critic(value_delta).squeeze(-1)
+        if self.architecture == 'mlp':
+            values = values + self.joint_critic(torch.cat((value_features, value_delta), dim=-1)).squeeze(-1)
         return logits, values
 
     @torch.no_grad()

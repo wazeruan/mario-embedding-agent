@@ -143,7 +143,7 @@ def test_collection_exact_dedup_grouping_and_death_only_resets(tmp_path, monkeyp
         assert env.closed and len(env.resets) == 1 + env.deaths
 
 
-@pytest.mark.parametrize('resume_kind', ['fresh', 'teacher', 'different_student', 'same_student'])
+@pytest.mark.parametrize('resume_kind', ['fresh', 'fresh_mlp', 'teacher', 'different_student', 'same_student', 'same_student_mlp', 'legacy_to_mlp'])
 def test_cli_student_teacher_free_and_resume_backend_identity(monkeypatch, tmp_path, resume_kind):
     from mario_embedding_agent import cli
     from mario_embedding_agent.policy import ActorCritic
@@ -153,13 +153,17 @@ def test_cli_student_teacher_free_and_resume_backend_identity(monkeypatch, tmp_p
     cache = tmp_path/'models/action-embeddings.pt'
     cache.parent.mkdir()
     torch.save(dict(metadata=action_cache_metadata(70), embeddings=torch.ones(18, 768)), cache)
-    policy = ActorCritic(torch.ones(18, 768))
+    is_mlp = resume_kind in ('fresh_mlp', 'same_student_mlp')
+    policy = ActorCritic(torch.ones(18, 768), architecture='mlp' if is_mlp else 'legacy',
+                         **({'feature_mean': torch.full((768,), .01), 'feature_std': torch.full((768,), .02)} if is_mlp else {}))
     optimizer = torch.optim.AdamW(policy.parameters(), lr=3e-4, weight_decay=0.)
     old_config = {'reward_scale': 50., 'image_tokens': 70, 'seed': 0,
                   'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
                   'encoder_backend': 'embeddinggemma2' if resume_kind == 'teacher' else 'student',
                   'student_fingerprint': None if resume_kind == 'teacher' else
                       ('different' if resume_kind == 'different_student' else fingerprint)}
+    if is_mlp:
+        old_config.update(policy_architecture='mlp', feature_standardization='student-output-train-stats-v1')
     payload = {'config': old_config, 'policy': policy.state_dict(),
                'optimizer': optimizer.state_dict(),
                'training_state': {'episode_seed': 0, 'episode_commands': [],
@@ -177,17 +181,31 @@ def test_cli_student_teacher_free_and_resume_backend_identity(monkeypatch, tmp_p
     monkeypatch.setattr(cli.checkpoint, 'load', lambda path: payload)
     monkeypatch.setattr(cli.checkpoint, 'save', lambda path, policy, optimizer, config, state: saved.append(dict(config)))
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
+    import mario_embedding_agent.student as student_module
+    if resume_kind == 'fresh_mlp':
+        calibration_calls = []
+        def calibrate(encoder, path):
+            calibration_calls.append(path)
+            return torch.full((768,), .01), torch.full((768,), .02)
+        monkeypatch.setattr(student_module, 'calibrate_policy_features', calibrate)
+    else:
+        monkeypatch.setattr(student_module, 'calibrate_policy_features', lambda *args: pytest.fail('Unexpected calibration'))
     argv = ['mario-agent', 'train', '--student-encoder', str(path), '--headless', '--mode', 'sync', '--total-frames', '1']
-    if resume_kind != 'fresh':
+    if not is_mlp:
+        argv += ['--policy-architecture', 'mlp' if resume_kind == 'legacy_to_mlp' else 'legacy']
+    if resume_kind not in ('fresh', 'fresh_mlp'):
         argv += ['--resume', 'resume.pt']
     monkeypatch.setattr(sys, 'argv', argv)
-    if resume_kind in ('teacher', 'different_student'):
+    if resume_kind in ('teacher', 'different_student', 'legacy_to_mlp'):
         with pytest.raises(ValueError, match='configuration is incompatible'):
             cli.main()
         assert not saved
     else:
         cli.main()
         assert saved[-1]['encoder_backend'] == 'student'
+        assert saved[-1]['policy_architecture'] == ('mlp' if is_mlp else 'legacy')
+        if resume_kind == 'fresh_mlp':
+            assert len(calibration_calls) == 1
         assert saved[-1]['student_fingerprint'] == fingerprint
 
 

@@ -94,8 +94,10 @@ def update(policy, optimizer, transitions, bootstrap_value, *, epochs=2, minibat
             loss.backward()
             if not eligible.any():
                 # Zero gradients still advance Adam momentum and weight decay.
-                # Assisted batches must leave both actor branches untouched.
-                for module in (policy.actor, policy.temporal_actor):
+                # Assisted batches must leave all actor branches untouched.
+                for module in (policy.actor, policy.temporal_actor, getattr(policy, 'nonlinear_actor', None)):
+                    if module is None:
+                        continue
                     for parameter in module.parameters():
                         parameter.grad = None
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
