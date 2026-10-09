@@ -80,6 +80,8 @@ def main():
     parser.add_argument('--device', default='auto')
     parser.add_argument('--policy-architecture', choices=['legacy', 'mlp'], help='Fresh runs default to mlp; resumes keep the saved architecture')
     parser.add_argument('--student-encoder', type=Path, help='Distilled image encoder checkpoint; defaults to CPU')
+    parser.add_argument('--calibration-frames', type=Path, default=ROOT/'models/distillation/frames.pt',
+                        help='Distillation frames used to calibrate a fresh student policy')
     parser.add_argument('--headless', action='store_true')
     parser.add_argument('--mode', choices=['sync', 'realtime'],
                         help='Emulator pacing; defaults to sync for evaluation and realtime otherwise')
@@ -120,7 +122,7 @@ def main():
               'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
               'death_penalty': 15.0, 'clear_reward': 50.0, 'pixels_per_reward': 32.0,
-              'progress_clip': 5.0, 'reward_version': 'visual-frontier-v4',
+              'progress_clip': 5.0, 'reward_version': 'visual-frontier-v5', 'stall_timeout_frames': 1800,
               'ppo_epochs': 4, 'ppo_minibatch_size': 32, 'target_kl': 0.02, 'value_clip': None,
               'discount_reference_frames': 20, 'optimizer_weight_decay': 0.0,
               'left_action_logit_bias': -3.0, 'entropy_coef': 0.01,
@@ -163,7 +165,7 @@ def main():
             'left_action_logit_bias', 'entropy_coef', 'temporal_context', 'stagnation_threshold',
             'stagnation_deadband_px', 'recovery_actions', 'recovery_logit_bias',
             'recovery_down_hold_frames', 'recovery_progress_px', 'recovery_progress_window',
-            'recovery_progress_events_required', 'recovery_window_net_progress_px')})
+            'recovery_progress_events_required', 'recovery_window_net_progress_px', 'stall_timeout_frames')})
         recovery_behavior_migrated |= saved_config.get('pipe_recovery') != config['pipe_recovery']
         saved_config['pipe_recovery'] = config['pipe_recovery']
         saved_config.setdefault('gap_bonus', 1.0)
@@ -186,13 +188,14 @@ def main():
             else:
                 from .student import calibrate_policy_features
                 print('Calibrating policy inputs on training-stream student outputs...', flush=True)
-                mean, std = calibrate_policy_features(encoder, ROOT/'models/distillation/frames.pt')
+                mean, std = calibrate_policy_features(encoder, args.calibration_frames)
             policy_kwargs.update(feature_mean=mean, feature_std=std)
     policy = ActorCritic(embeddings, left_action_logit_bias=config['left_action_logit_bias'], **policy_kwargs)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=config['learning_rate'],
                                  weight_decay=config['optimizer_weight_decay'])
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
              'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0,
+             'stalls': 0, 'stall_frames': 0, 'stall_frontier_px': 0.0,
              'stagnant_decisions': 0, 'recovery_active': False, 'recovery_action_index': 0,
              'recovery_progress_window': [], 'previous_features': None}
     if args.command == 'evaluate':
@@ -281,6 +284,7 @@ def main():
 
     def state_counts():
         return {**{k: state[k] for k in ('frames', 'decisions', 'updates', 'deaths', 'clears', 'gaps',
+                                      'stalls', 'stall_frames',
                                       'stagnant_decisions', 'recovery_active', 'recovery_action_index',
                                       'recovery_progress_window')},
                 'visual_position_px': frontier.position, 'visual_frontier_px': frontier.frontier}
@@ -304,7 +308,7 @@ def main():
                          pixels_per_reward=config['pixels_per_reward'], progress_clip=config['progress_clip'],
                          deadband_px=0.0)
         last_reward = raw
-        if outcome in ('death', 'level_clear'):
+        if outcome in ('death', 'stall', 'level_clear'):
             reset_recovery()
         if args.command == 'evaluate':
             # Count terminal rewards even if the death/transition lands while
@@ -315,7 +319,7 @@ def main():
         if active is not None:
             recovery_evidence_events = 0
             recovery_window_net_progress = 0.0
-            if outcome not in ('death', 'level_clear'):
+            if outcome not in ('death', 'stall', 'level_clear'):
                 if state['recovery_active']:
                     window = state['recovery_progress_window']
                     window.append(active['right_progress'])
@@ -481,28 +485,40 @@ def main():
                 active['right_progress'] += right_progress
             cleared = detector.observe(frame)
             crossed = gap_detector.observe(frame)
+            # A training episode that reaches no new visual ground for the timeout
+            # ends like a death: the game timer would kill Mario anyway, but thousands
+            # of frames later, where discounting hides the penalty and samples are wasted.
+            if frontier.frontier > state['stall_frontier_px']:
+                state['stall_frontier_px'] = frontier.frontier
+                state['stall_frames'] = 0
+            else:
+                state['stall_frames'] += 1
+            stalled = (args.command == 'train' and not died and not cleared and
+                       state['stall_frames'] >= config['stall_timeout_frames'])
             if crossed and not died and not cleared and active is not None:
                 active['gap_bonus'] += config['gap_bonus']
                 state['gaps'] += 1
                 image_path = logdir/f'gap-{state["frames"]}.png'
                 Image.fromarray(frame).save(image_path)
                 emit('gap_crossing', bonus=config['gap_bonus'], captured_frame=str(image_path))
-            if died or cleared:
-                outcome = 'death' if died else 'clear'
+            if died or cleared or stalled:
+                outcome = 'death' if died else 'stall' if stalled else 'clear'
                 image_path = logdir/f'{outcome}-{state["frames"]}.png'
                 Image.fromarray(frame).save(image_path)
-                finish(reward(died, cleared, death_penalty=config['death_penalty'],
+                finish(reward(died or stalled, cleared, death_penalty=config['death_penalty'],
                               clear_reward=config['clear_reward']), True,
-                       outcome='death' if died else 'level_clear')
+                       outcome='level_clear' if outcome == 'clear' else outcome)
                 frontier.reset()
+                state['stall_frames'] = 0
+                state['stall_frontier_px'] = 0.0
                 state['previous_features'] = None
-                state['deaths' if died else 'clears'] += 1
+                state[{'death': 'deaths', 'stall': 'stalls', 'clear': 'clears'}[outcome]] += 1
                 emit(outcome, raw_reward=last_reward, captured_frame=str(image_path))
                 generation += 1
                 gap_detector = GapDetector()
                 if cleared:
                     motion.reset(frame)
-                if died:
+                if died or stalled:
                     if args.command == 'evaluate':
                         evaluation['episodes'] += 1
                         episode_frames = state['frames']-evaluation['episode_start_frames']
@@ -567,7 +583,7 @@ def main():
                          f'New ground {frontier.frontier:.0f}px',
                          f'Rollout {len(rollout)}/{args.rollout}, actor {metrics.get("actor_samples", 0)}',
                          f'Updates {state["updates"]} KL {metrics.get("final_kl", 0):.3g}',
-                         f'Dead {state["deaths"]} clear {state["clears"]} gaps {state["gaps"]}', f'Reward {last_reward:g} / {last_reward/config["reward_scale"]:g}',
+                         f'Dead {state["deaths"]} stalled {state["stalls"]} clear {state["clears"]} gaps {state["gaps"]}', f'Reward {last_reward:g} / {last_reward/config["reward_scale"]:g}',
                          *[f'{k}: {metrics[k]:.4g}' for k in ('policy_loss', 'value_loss', 'entropy', 'explained_variance') if isinstance(metrics.get(k), (float, int))],
                          'Recovery probabilities:' if active and active['recovery_action'] else 'Policy probabilities:',
                          *[f'{ACTIONS[i].name}: {probabilities[i]:.2f}' for i in sorted(range(len(probabilities)), key=lambda i: probabilities[i], reverse=True)[:3]],

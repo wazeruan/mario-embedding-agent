@@ -212,7 +212,7 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     assert config['optimizer_weight_decay'] == 0.
     assert config['pixels_per_reward'] == 32.
     assert config['progress_clip'] == 5.
-    assert config['reward_version'] == 'visual-frontier-v4'
+    assert config['reward_version'] == 'visual-frontier-v5'
     assert config['gap_bonus'] == 1.
     assert config['left_action_logit_bias'] == -3.
     assert config['entropy_coef'] == .01

@@ -80,6 +80,31 @@ Seed 0 collection yielded 1,024 globally unique real screenshots across 25 strea
 
 On 32 evenly spaced held-out screenshots, warmed uncached inference including preprocessing and CPU feature return measured median 0.735 ms / p95 0.778 ms for the CPU student, versus 162.907 ms / 186.460 ms for the MPS teacher. This is approximately 222× faster for the encoder on this machine; it does not imply 222× faster decisions or PPO. The student has 499,728 parameters and its artifact is about 2 MB. Benchmark-subset cosine was 0.99473, standardized RMSE 0.88020 versus the mean baseline's 0.96241, and pairwise-distance correlation 0.501. Action-prototype top-1 agreement was 100% on this small subset; this is retrieval agreement, not PPO action agreement or game success. Gameplay improvement has not been evaluated.
 
+### Larger distillation set and finer student (2026-10-09)
+
+The 769-frame pilot student lost most information about whether Mario is airborne. Linear probes on held-out stream 3 of a new 6,144-frame collection (`--seed 1`) predict pixel-derived labels: Mario screen x (R²), airborne and obstacle-ahead (accuracy; majority baselines 0.63 and 0.62).
+
+| Features | Mario x R² | Airborne | Obstacle | Std. RMSE vs teacher | Distance corr. |
+|---|---|---|---|---|---|
+| EmbeddingGemma-2 | 0.71 | 0.95 | 0.87 | — | — |
+| Pilot student (769 frames, 4×4 pool) | 0.81 | 0.72 | 0.78 | 0.88 | 0.50 |
+| 6k student, 4×4 pool | 0.85 | 0.96 | 0.89 | 0.57 | 0.78 |
+| 6k student, 8×8 pool | 0.81 | 0.94 | 0.87 | 0.54 | 0.83 |
+
+In 300k-frame PPO runs (seed 0, sync, unthrottled), median per-episode visual frontier over the last 50k frames was 698 px for the pilot student (its policy entropy had collapsed), 1,083 px for the 6k 4×4 student and 1,323 px for the 6k 8×8 student (259 heuristic gap detections). This is one seed per configuration. `mario-distill train` now defaults to `--pool 8`; older student files load with their saved pool (4 when absent).
+
+```sh
+uv run mario-distill collect --samples 6144 --seed 1 --data models/distillation/frames-6k.pt
+uv run mario-distill train --data models/distillation/frames-6k.pt --output models/distillation/student-6k-p8.pt
+uv run mario-agent train --student-encoder models/distillation/student-6k-p8.pt --calibration-frames models/distillation/frames-6k.pt --mode sync --headless --fps 0 --checkpoint checkpoints/student-6k.pt
+```
+
+Fresh student policies calibrate on `--calibration-frames` (default `models/distillation/frames.pt`); use the set the student was distilled on.
+
+### Stall timeout
+
+Training ends an episode that reaches no new visual ground for 1,800 frames (30 s at 60 FPS) with outcome `stall`, the death penalty and a reset to the next seed. Without it, a policy stuck behind an obstacle waited about 8,000 frames for the game timer; that late penalty is nearly invisible after discounting and the frames are wasted. Evaluation and play never stall-terminate. The decision is based only on the RGB-derived frontier.
+
 ### Underground exit-pipe recovery
 
 The generic recovery cycle can leave Mario on top of the low pipe beside the underground room's green wall: a four-frame retreat followed by another right jump does not reliably clear the pipe. During stagnation, an RGB-only detector now recognizes the black room, tall right-side green wall, low adjoining pipe, and Mario sprite. It retreats left in 16-frame segments until Mario clears the edge, releases buttons in 8-frame segments while falling, then walks right in 24-frame segments into the pipe's left-facing side entrance. Each decision rechecks the screenshot; unsupported or ambiguous scenes retain generic recovery. No game metadata or additional rewards are used.

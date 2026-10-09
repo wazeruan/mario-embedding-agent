@@ -19,13 +19,16 @@ def preprocess(frames):
 
 
 class SmallEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, pool=4):
         super().__init__()
+        # Pool size sets spatial resolution: 4x4 cells (~60px tall) blur Mario's
+        # height above ground; 8x8 keeps it at a modest parameter cost.
+        self.pool = int(pool)
         self.net = nn.Sequential(nn.Conv2d(3, 24, 5, 2, 2), nn.GELU(),
             nn.Conv2d(24, 48, 3, 2, 1), nn.GELU(),
             nn.Conv2d(48, 64, 3, 2, 1), nn.GELU(),
-            nn.AdaptiveAvgPool2d((4, 4)), nn.Flatten(),
-            nn.Linear(1024, 256), nn.GELU(), nn.Linear(256, 768))
+            nn.AdaptiveAvgPool2d((self.pool, self.pool)), nn.Flatten(),
+            nn.Linear(64*self.pool*self.pool, 256), nn.GELU(), nn.Linear(256, 768))
         self.register_buffer('target_mean', torch.zeros(768))
         self.register_buffer('target_std', torch.ones(768))
 
@@ -41,6 +44,7 @@ def save_student(model, path, metrics=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.tmp')
     torch.save({'format': 'mario-student-v1', 'metadata': action_cache_metadata(70),
+                'pool': model.pool,
                 'weights': {k: v.detach().cpu() for k, v in model.state_dict().items()},
                 'metrics': metrics or {}}, temporary)
     temporary.replace(path)
@@ -55,7 +59,7 @@ class StudentEncoder:
         self.fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
         self.device = 'cpu' if device == 'auto' else device
         self.image_tokens = 70
-        self.model = SmallEncoder().to(self.device)
+        self.model = SmallEncoder(payload.get('pool', 4)).to(self.device)
         self.model.load_state_dict(payload['weights'])
         self.model.eval().requires_grad_(False)
 
