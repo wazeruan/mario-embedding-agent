@@ -194,13 +194,13 @@ def install_fake_cli(monkeypatch, tmp_path, cli, sleeps):
     monkeypatch.setattr(cli.time, 'sleep', lambda seconds: sleeps.append(seconds))
 
 
-@pytest.mark.parametrize('mode', ['realtime', None])
+@pytest.mark.parametrize('mode', ['realtime'])  # Default mode is now sync, where fps 0 is valid.
 def test_fps_zero_rejected_outside_sync_mode(monkeypatch, tmp_path, capsys, mode):
     from mario_embedding_agent import cli
     install_fake_cli(monkeypatch, tmp_path, cli, [])
-    argv = ['mario-agent', 'train', '--headless', '--fps', '0', '--total-frames', '4']
+    argv = ['mario-agent', 'train', '--teacher', '--headless', '--fps', '0', '--total-frames', '4']
     if mode:
-        argv += ['--mode', mode]  # Train otherwise defaults to realtime.
+        argv += ['--mode', mode]
     monkeypatch.setattr(sys, 'argv', argv)
     with pytest.raises(SystemExit) as error:
         cli.main()
@@ -210,7 +210,7 @@ def test_fps_zero_rejected_outside_sync_mode(monkeypatch, tmp_path, capsys, mode
 
 def test_negative_fps_still_rejected(monkeypatch, tmp_path, capsys):
     from mario_embedding_agent import cli
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync', '--fps', '-1'])
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'sync', '--fps', '-1'])
     with pytest.raises(SystemExit):
         cli.main()
     assert 'non-negative' in capsys.readouterr().err
@@ -233,7 +233,7 @@ def test_fps_zero_sync_runs_unthrottled_and_updates_feature_statistics_after_ppo
 
     monkeypatch.setattr(cli, 'update', fake_update)
     monkeypatch.setattr(cli.checkpoint, 'save', save)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync', '--fps', '0',
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'sync', '--fps', '0',
                                     '--total-frames', '60', '--rollout', '2'])
     cli.main()
 
@@ -306,8 +306,10 @@ def test_resumed_trained_identity_checkpoint_keeps_acting_statistics_through_fir
     monkeypatch.setattr(cli, 'update', fake_update)
     monkeypatch.setattr(cli.checkpoint, 'load', lambda path: payload)
     monkeypatch.setattr(cli.checkpoint, 'save', lambda *args: None)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync', '--fps', '0',
-                                    '--total-frames', '12', '--rollout', '2', '--resume', 'old.pt'])
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'sync', '--fps', '0',
+                                    '--total-frames', '12', '--rollout', '2', '--resume'])
+    (tmp_path/'checkpoints').mkdir(exist_ok=True)
+    (tmp_path/'checkpoints/latest.pt').write_bytes(b'placeholder')  # load is faked
     cli.main()
     count, mean, std = at_update[0]
     # The rollout was collected with identity statistics, so PPO must evaluate it with them.

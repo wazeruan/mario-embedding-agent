@@ -13,22 +13,18 @@ The pinned [official encoder](https://huggingface.co/google/embeddinggemma-2) re
 ```sh
 cd /Users/weiciruan/Documents/mario-embedding-agent
 uv sync
-uv run mario-agent prepare
-uv run mario-agent train
+uv run mario-agent prepare          # download EmbeddingGemma-2 and encode the action texts
+uv run mario-agent train            # start a new run in checkpoints/latest.pt
+uv run mario-agent train --resume   # continue it
+uv run mario-agent play             # watch the latest checkpoint
+uv run mario-agent evaluate         # deterministic, headless check of the latest checkpoint
 ```
 
-The default visible realtime mode keeps the emulator running at a target of 60 FPS while one encoder worker processes screenshots. It has no inference backlog. Short jumps hold A for 4 emulator frames and release it for 2; long jumps hold A for 20 and release for 2. While waiting for the next decision, all controller buttons are released after the macro, so inference cannot accidentally extend a short jump. Incoming observations can still be several frames old; the UI shows their age and exact input screenshot.
+Defaults: frames are encoded by the distilled IMPALA student (`models/distillation/student.pt`, CPU, ~3 ms) and the policy decides on the current screenshot (`--mode sync`). Training and evaluation run headless and unthrottled (about 650 FPS on an M4); play opens the game window at 60 FPS. Every command uses `checkpoints/latest.pt`, which training saves after each PPO update, so `play` can watch a run while it trains. `train` refuses to overwrite an existing checkpoint: continue it with `--resume`, or move it away to start fresh. Stop training with a single Ctrl+C; it saves before exiting.
 
-```sh
-uv run mario-agent train --resume checkpoints/latest.pt
-uv run mario-agent play --checkpoint checkpoints/latest.pt
-uv run mario-agent train --mode sync
-uv run mario-agent evaluate --checkpoint checkpoints/latest.pt --episodes 10 --seed 0 --mode sync
-```
+Options: `--teacher` encodes with EmbeddingGemma-2 itself (~160 ms per frame on MPS); `--checkpoint PATH` selects another run; `--show` displays the window while training; `--fps 30` slows play; `--mode realtime` keeps the emulator running during inference, so the policy sees screenshots several frames old. `--total-frames N` bounds a diagnostic run. A fresh student run calibrates its input statistics on `--calibration-frames` (default `models/distillation/frames.pt`). Models must be prepared before train/play/evaluate.
 
-Sync pauses emulator advancement during encoding, so each decision uses the current screenshot. Its wall-clock game rate is slower; this mode helps inspect mistakes without inference staleness. Evaluation defaults to sync so repeated checkpoint/seed comparisons do not depend on encoder thread timing. `--fps 30` slows emulator pacing in either mode. `--mode sync --fps 0` removes pacing entirely for fast training (about 400 FPS headless with the student encoder on this machine, versus the 60 FPS default). There is no default time or frame cutoff. Close the window, press Escape or Ctrl+C to stop and save. `--headless --total-frames 600` is an explicit finite diagnostic. Models must be prepared before train/play/evaluate. Direct-actor PPO v1 checkpoints migrate automatically; checkpoints from the earlier LoRA implementation are incompatible.
-
-`evaluate` loads a checkpoint's policy and runs deterministic argmax actions without updating or saving weights. It reports each death-ended attempt plus aggregate frames, decisions, screenshot-derived reward/progress, detected gap crossings and world transitions. Seeds advance only after a visually observed death; there is no per-attempt time/frame cutoff. This is a frozen-policy comparison, not proof of final-game completion; the existing clear detector sees intermediate WORLD transitions.
+Each action is a button macro: short jumps hold A for 4 emulator frames and release it for 2; long jumps hold A for 20 and release for 2. While waiting for the next decision, all buttons are released after the macro, so inference cannot accidentally extend a jump.
 
 ## Actions and objective
 
@@ -60,19 +56,18 @@ Resuming a checkpoint from an earlier reward objective preserves actor weights, 
 
 ## Distilled image encoder (experimental)
 
-The small CNN learns the frozen teacher's 768-dimensional normalized image embeddings from real Mario screenshots. It predicts standardized embedding residuals using statistics computed only on training frames. This prevents dominant shared embedding directions from disguising a constant-output student. Action text vectors remain pre-encoded by the teacher; the student accepts images only. PPO continues to train its actor/critic from detached student features; it does not update the encoder online.
+The student CNN learns the frozen teacher's 768-dimensional normalized image embeddings from real Mario screenshots. It predicts standardized embedding residuals using statistics computed only on training frames. This prevents dominant shared embedding directions from disguising a constant-output student. Action text vectors remain pre-encoded by the teacher; the student accepts images only. PPO continues to train its actor/critic from detached student features; it does not update the encoder online.
 
 ```sh
 uv run mario-agent prepare
-uv run mario-distill collect --samples 1024
-uv run mario-distill train --epochs 60
-uv run mario-distill benchmark
-uv run mario-agent train --student-encoder models/distillation/student.pt --checkpoint checkpoints/student-scratch.pt
+uv run mario-distill collect --samples 6144 --seed 1 --data models/distillation/frames-new.pt
+uv run mario-distill train --data models/distillation/frames-new.pt --output models/distillation/student-new.pt
+uv run mario-distill benchmark --data models/distillation/frames-new.pt --output models/distillation/student-new.pt
 ```
 
 Collection interleaves four independently seeded emulator streams, retains original RGB frames and teacher vectors, and resets each environment only after death. Exact duplicate frames are removed globally. Stream 3 is held out entirely, including all its episodes; this is a small pilot dataset rather than comprehensive gameplay coverage. Both training and benchmark reports compare the student with the training-mean embedding baseline. The benchmark measures uncached, warmed inference on the same held-out screenshots and writes `models/distillation/student.benchmark.json`; embedding agreement is not evidence of improved gameplay.
 
-The default encoder remains EmbeddingGemma-2. Student inference defaults to CPU and does not load the teacher. Keep the prepared action cache. Start a fresh PPO checkpoint when switching encoders; resume requires the identical student artifact fingerprint. Re-distilling creates a new encoder identity. Increase data diversity before treating the pilot student as a replacement.
+The distilled student is the default encoder (`--teacher` uses EmbeddingGemma-2 directly). Student inference runs on CPU and never loads the teacher; keep the prepared action cache. A checkpoint resumes or plays only with the encoder it was trained with: the same backend and, for students, the identical student file fingerprint. Re-distilling creates a new encoder identity and needs a fresh PPO run, so `mario-distill collect` and `train` refuse to overwrite existing files.
 
 ### Local pilot results (2026-10-08)
 
@@ -91,15 +86,10 @@ The 769-frame pilot student lost most information about whether Mario is airborn
 | 6k student, 4×4 pool | 0.85 | 0.96 | 0.89 | 0.57 | 0.78 |
 | 6k student, 8×8 pool | 0.81 | 0.94 | 0.87 | 0.54 | 0.83 |
 
-In 300k-frame PPO runs (seed 0, sync, unthrottled), median per-episode visual frontier over the last 50k frames was 698 px for the pilot student (its policy entropy had collapsed), 1,083 px for the 6k 4×4 student and 1,323 px for the 6k 8×8 student (259 heuristic gap detections). This is one seed per configuration. `mario-distill train` now defaults to `--pool 8`; older student files load with their saved pool (4 when absent).
+In 300k-frame PPO runs (seed 0, sync, unthrottled), median per-episode visual frontier over the last 50k frames was 698 px for the pilot student (its policy entropy had collapsed), 1,083 px for the 6k 4×4 student and 1,323 px for the 6k 8×8 student (259 heuristic gap detections). This is one seed per configuration. (These plain-CNN students were later replaced by the IMPALA student below.)
 
-```sh
-uv run mario-distill collect --samples 6144 --seed 1 --data models/distillation/frames-6k.pt
-uv run mario-distill train --data models/distillation/frames-6k.pt --output models/distillation/student-6k-p8.pt
-uv run mario-agent train --student-encoder models/distillation/student-6k-p8.pt --calibration-frames models/distillation/frames-6k.pt --mode sync --headless --fps 0 --checkpoint checkpoints/student-6k.pt
-```
 
-Fresh student policies calibrate on `--calibration-frames` (default `models/distillation/frames.pt`); use the set the student was distilled on.
+The 6k set and the IMPALA student are now the defaults (`models/distillation/frames.pt`, `student.pt`); the pilot data and the plain CNN students were retired.
 
 ### Student CNN architecture (2026-10-09)
 
@@ -111,12 +101,8 @@ Three students were distilled on the same 6,144-frame set and trained with PPO f
 | small, 2× width | 2.45M | 1.2 | 0.533 | 26 | — |
 | IMPALA CNN, 16/32/64, 8×8 pool | 1.46M | 2.7 | 0.532 | **42** | **22** |
 
-All three imitate the teacher about equally and match it on the linear probes; doubling width gave nothing. The IMPALA encoder (conv, max-pool and two residual blocks per stage; Espeholt et al., 2018) gave more level clears on both seeds and a better-fitting critic (late explained variance 0.55–0.59 vs 0.13–0.35). `mario-distill train` now defaults to `--arch impala`; `--arch small` and `--width` remain available, and existing student files load with their saved architecture.
+All three imitate the teacher about equally and match it on the linear probes; doubling width gave nothing. The IMPALA encoder (conv, max-pool and two residual blocks per stage; Espeholt et al., 2018) gave more level clears on both seeds and a better-fitting critic (late explained variance 0.55–0.59 vs 0.13–0.35). The plain CNN was then removed: `mario-distill train` always builds the IMPALA student (`--width` scales its channels), and only IMPALA student files load.
 
-```sh
-uv run mario-distill train --data models/distillation/frames-6k.pt --output models/distillation/student-6k-impala.pt
-uv run mario-agent train --student-encoder models/distillation/student-6k-impala.pt --calibration-frames models/distillation/frames-6k.pt --mode sync --headless --fps 0 --checkpoint checkpoints/student-impala.pt
-```
 
 ### Stall timeout
 
@@ -141,9 +127,6 @@ Fresh training defaults to `--policy-architecture mlp`. The nonlinear actor uses
 
 For a fresh student policy, calibration measures the actual normalized student outputs on training-stream screenshots in `models/distillation/frames.pt`; held-out stream 3 is excluded. Mean and standard deviation (floor 0.001) initialize the policy buffers and count as 1,024 prior observations. Current features subtract the training mean; deltas use the same fixed per-coordinate scale without mean subtraction. Both are clipped to ±10. Delta scaling is not an empirical temporal-variance estimate. Teacher MLP policies start from identity statistics; a fresh run seeds them from its first rollout before the first update (zero-initialized output layers make this output-preserving). After every PPO update, the rollout's features are merged into the running mean/std (`running-rollout-v1`), never between an action and its update, so stored log-probabilities stay valid. This matters because EmbeddingGemma frame embeddings have mean pairwise cosine 0.986: unstandardized, the network sees nearly constant inputs. This calibration addresses weak frame variation rather than adding game metadata or changing rewards.
 
-```sh
-uv run mario-agent train --student-encoder models/distillation/student.pt --policy-architecture mlp --checkpoint checkpoints/student-mlp-scratch.pt
-```
 
 An existing checkpoint resumes its saved architecture; older checkpoints are interpreted as `legacy`. Resume/play/evaluation reuse saved calibration without requiring the frame dataset. An explicit incompatible architecture override is rejected. To use the nonlinear policy with a legacy run, start a fresh checkpoint. Recovery-only batches leave all actor branches unchanged, including Adam momentum and weight decay; only value heads update.
 

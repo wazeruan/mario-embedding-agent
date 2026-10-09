@@ -141,7 +141,7 @@ def test_realtime_releases_macro_buttons_while_waiting_and_records_executed_dura
     monkeypatch.setattr(cli, 'update', ppo)
     monkeypatch.setattr(cli.checkpoint, 'save', lambda *args: None)
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'realtime',
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'realtime',
                                     '--total-frames', '13', '--rollout', '2'])
     cli.main()
     assert commands[:4] == [('right',)] * 4
@@ -266,7 +266,7 @@ def test_initial_inference_wait_progress_is_explored_but_not_paid_to_first_actio
     monkeypatch.setattr(cli, 'update', ppo)
     monkeypatch.setattr(cli.checkpoint, 'save', lambda *args: None)
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'realtime',
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'realtime',
                                     '--total-frames', '12', '--rollout', '2'])
     cli.main()
     assert commands[:3] == [()] * 3

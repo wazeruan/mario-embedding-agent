@@ -109,7 +109,7 @@ def test_death_on_ppo_boundary_autosaves_reset_episode(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.ActorCritic, 'act', lambda *args, **kwargs: (0, 0., 0., [1.] + [0.] * 17))
     monkeypatch.setattr(cli.checkpoint, 'save', lambda path, policy, optimizer, config, state: saved.append(copy.deepcopy(state)))
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync',
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'sync',
                                     '--total-frames', '8', '--rollout', '2'])
     cli.main()
     assert env.resets == 2

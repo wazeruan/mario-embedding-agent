@@ -113,6 +113,10 @@ def run(monkeypatch, tmp_path, argv, *, motion=lambda env: 1.0, died=lambda env:
         monkeypatch.setattr(cli.checkpoint, 'load', lambda path: payload)
     monkeypatch.setattr(cli, 'torch', proxy)
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
+    argv = [*argv, '--teacher']
+    if '--resume' in argv or argv[0] in ('play', 'evaluate'):
+        (tmp_path/'checkpoints').mkdir(exist_ok=True)
+        (tmp_path/'checkpoints/latest.pt').write_bytes(b'placeholder')  # load is faked
     monkeypatch.setattr(sys, 'argv', ['mario-agent', *argv])
     cli.main()
     command = argv[0]
@@ -270,7 +274,7 @@ def legacy_payload(training_state):
 
 @pytest.mark.parametrize('command', ['evaluate', 'play'])
 def test_evaluate_and_play_never_snapshot_or_restore(monkeypatch, tmp_path, command):
-    argv = ([command, '--headless', '--checkpoint', 'p.pt'] +
+    argv = ([command, '--headless'] +
             (['--episodes', '1', '--seed', '7'] if command == 'evaluate' else
              ['--mode', 'sync', '--total-frames', '340']))
     env, events, saved, proxy = run(monkeypatch, tmp_path, argv, died=at_total(330),
@@ -284,7 +288,7 @@ def test_evaluate_and_play_never_snapshot_or_restore(monkeypatch, tmp_path, comm
 def test_old_checkpoint_without_restart_keys_resumes_and_restarts(monkeypatch, tmp_path):
     payload = legacy_payload({})
     assert 'restart_probability' not in payload['config'] and 'restarts' not in payload['training_state']
-    env, events, saved, _ = run(monkeypatch, tmp_path, train_argv(340) + ['--resume', 'old.pt'],
+    env, events, saved, _ = run(monkeypatch, tmp_path, train_argv(340) + ['--resume'],
                                 died=at_total(330), payload=payload)
     started, = kinds(events, 'started')
     assert started['restarts'] == 0 and started['reward_objective_migrated'] is False

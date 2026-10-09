@@ -154,7 +154,7 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
     monkeypatch.setattr(cli.ActorCritic, 'act', lambda *args, **kwargs: (0, 0., 0., [1.] + [0.] * 17))
     monkeypatch.setattr(cli.checkpoint, 'save', lambda path, policy, optimizer, config, state: saved.append(copy.deepcopy(state)))
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync',
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'sync',
                                     '--total-frames', '10', '--rollout', '2'])
     cli.main()
     expected_rewards = [value/15 for value in expected_rewards]

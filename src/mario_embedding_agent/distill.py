@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from .actions import ACTIONS
 from .encoder import FrozenEncoder, action_cache_metadata
 from .environment import make_env, step
-from .student import SmallEncoder, StudentEncoder, preprocess, save_student
+from .student import StudentCNN, StudentEncoder, preprocess, save_student
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -92,13 +92,13 @@ def metrics(predicted, target, mean, std):
             'pairwise_distance_correlation': correlation}
 
 
-def train(data_path, output, epochs=60, seed=0, pool=8, arch='impala', width=1):
+def train(data_path, output, epochs=60, seed=0, pool=8, width=1):
     torch.set_num_threads(4)
     torch.manual_seed(seed)
     data, train_mask, valid_mask = load_data(data_path)
     inputs = preprocess(data['frames'])
     targets = F.normalize(data['targets'].float(), dim=1)
-    model = SmallEncoder(pool, arch, width)
+    model = StudentCNN(pool, width)
     model.target_mean.copy_(targets[train_mask].mean(0))
     model.target_std.copy_(targets[train_mask].std(0).clamp_min(1e-3))
     residuals = (targets-model.target_mean)/model.target_std
@@ -172,15 +172,20 @@ def main():
     parser.add_argument('--epochs', type=int, default=60)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--pool', type=int, default=8, help='Student spatial pooling grid (train only)')
-    parser.add_argument('--arch', choices=SmallEncoder.ARCHITECTURES, default='impala', help='Student CNN (train only)')
     parser.add_argument('--width', type=float, default=1, help='Student channel multiplier (train only)')
     parser.add_argument('--device', default='auto')
     args = parser.parse_args()
     if args.samples < 64 or args.epochs < 1:
         parser.error('samples >=64 and epochs >=1 required')
+    # PPO checkpoints pin the student file's fingerprint, and the dataset took ~20 minutes
+    # of teacher encoding: never replace either silently.
+    target = {'collect': args.data, 'train': args.output}.get(args.command)
+    if target is not None and Path(target).exists():
+        parser.error(f'{target} already exists; pass a new --{"data" if args.command == "collect" else "output"} path '
+                     'or move the file away (checkpoints trained on the current student need it).')
     if args.command == 'collect':
         collect(args.data, args.samples, args.seed, args.device)
     elif args.command == 'train':
-        train(args.data, args.output, args.epochs, args.seed, args.pool, args.arch, args.width)
+        train(args.data, args.output, args.epochs, args.seed, args.pool, args.width)
     else:
         benchmark(args.data, args.output, args.device)

@@ -193,8 +193,10 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
     monkeypatch.setattr(cli.checkpoint, 'load', lambda path: payload)
     monkeypatch.setattr(cli.checkpoint, 'save', save)
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync',
-                                    '--total-frames', '1', '--resume', 'legacy.pt'])
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'sync',
+                                    '--total-frames', '1', '--resume'])
+    (tmp_path/'checkpoints').mkdir()
+    (tmp_path/'checkpoints/latest.pt').write_bytes(b'placeholder')  # load is faked
     cli.main()
     config, state, weights, optimizer = saved[-1]
     assert config['reward_scale'] == 15.

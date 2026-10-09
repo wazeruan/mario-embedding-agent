@@ -1,4 +1,4 @@
-"""Training stall termination (no new visual ground) and student pooling-grid persistence."""
+"""Training stall termination, IMPALA student persistence, and CLI checkpoint/default behaviour."""
 import copy
 import json
 import sys
@@ -9,7 +9,7 @@ import torch
 
 from mario_embedding_agent import cli, distill
 from mario_embedding_agent.encoder import action_cache_metadata
-from mario_embedding_agent.student import SmallEncoder, StudentEncoder, preprocess, save_student
+from mario_embedding_agent.student import StudentCNN, StudentEncoder, preprocess, save_student
 
 TIMEOUT = 1800
 
@@ -80,6 +80,11 @@ def run(monkeypatch, tmp_path, argv, *, motion=None, death_at=(), clear_at=(), p
     if payload is not None:
         monkeypatch.setattr(cli.checkpoint, 'load', lambda path: payload)
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
+    if '--student-encoder' not in argv:
+        argv = [*argv, '--teacher']  # FrozenEncoder above is the fake.
+    if '--resume' in argv or argv[0] in ('play', 'evaluate'):
+        (tmp_path/'checkpoints').mkdir(exist_ok=True)
+        (tmp_path/'checkpoints/latest.pt').write_bytes(b'placeholder')  # load is faked
     monkeypatch.setattr(sys, 'argv', ['mario-agent', *argv])
     cli.main()
     command = argv[0]
@@ -89,7 +94,7 @@ def run(monkeypatch, tmp_path, argv, *, motion=None, death_at=(), clear_at=(), p
 
 def train_argv(frames):
     # Huge rollout so PPO updates never interleave; the final save still records state.
-    return ['train', '--headless', '--mode', 'sync', '--total-frames', str(frames), '--rollout', '100000']
+    return ['train', '--total-frames', str(frames), '--rollout', '100000']
 
 
 def test_train_stalls_after_exactly_timeout_frames_without_new_ground(monkeypatch, tmp_path):
@@ -180,8 +185,9 @@ def legacy_payload(training_state):
 
 def test_evaluate_never_stall_terminates(monkeypatch, tmp_path):
     payload = legacy_payload({})
+    (tmp_path/'p.pt').write_bytes(b'placeholder')
     env, events, transitions, saved = run(
-        monkeypatch, tmp_path, ['evaluate', '--headless', '--episodes', '1', '--seed', '7', '--checkpoint', 'p.pt'],
+        monkeypatch, tmp_path, ['evaluate', '--episodes', '1', '--seed', '7', '--checkpoint', str(tmp_path/'p.pt')],
         death_at={TIMEOUT+200}, payload=payload)
     assert not any(event['event'] == 'stall' for event in events)
     assert not list((tmp_path/'runs').glob('stall-*.png'))
@@ -193,7 +199,7 @@ def test_evaluate_never_stall_terminates(monkeypatch, tmp_path):
 
 def test_legacy_checkpoint_without_stall_keys_resumes(monkeypatch, tmp_path):
     payload = legacy_payload({'visual_position_px': 40., 'visual_frontier_px': 50.})
-    _, events, _, saved = run(monkeypatch, tmp_path, train_argv(3) + ['--resume', 'legacy.pt'], payload=payload)
+    _, events, _, saved = run(monkeypatch, tmp_path, train_argv(3) + ['--resume'], payload=payload)
     config, state = saved[-1]
     assert config['stall_timeout_frames'] == TIMEOUT
     assert config['reward_version'] == 'visual-frontier-v5'
@@ -209,7 +215,7 @@ def test_resumed_stall_counter_continues_across_checkpoint(monkeypatch, tmp_path
     payload = legacy_payload({'stalls': 4, 'stall_frames': TIMEOUT-5, 'stall_frontier_px': 0.,
                               'visual_position_px': 0., 'visual_frontier_px': 0.})
     payload['config'].update(reward_version='visual-frontier-v5', stall_timeout_frames=TIMEOUT)
-    env, events, _, saved = run(monkeypatch, tmp_path, train_argv(7) + ['--resume', 'x.pt'], payload=payload)
+    env, events, _, saved = run(monkeypatch, tmp_path, train_argv(7) + ['--resume'], payload=payload)
     stalls = [event for event in events if event['event'] == 'stall']
     assert [event['frames'] for event in stalls] == [105]
     assert env.resets == [3, 4]
@@ -217,60 +223,24 @@ def test_resumed_stall_counter_continues_across_checkpoint(monkeypatch, tmp_path
     assert state['stalls'] == 5 and state['deaths'] == 2 and state['stall_frames'] == 2
 
 
-def test_student_pool_roundtrip_and_legacy_payload(tmp_path):
-    torch.set_num_threads(1)
-    frame = np.zeros((240, 256, 3), dtype=np.uint8)
-    frame[100:140, 60:80] = (200, 50, 20)
-    model = SmallEncoder(pool=8).eval()
-    assert model.net[-3].in_features == 64*8*8
-    with torch.no_grad():
-        expected = model(preprocess(frame))[0]
-    assert expected.shape == (768,)
-    path = tmp_path/'student8.pt'
-    save_student(model, path)
-    assert torch.load(path, weights_only=True)['pool'] == 8
-    student = StudentEncoder(path)
-    assert student.model.pool == 8
-    actual = student.encode_frame(frame)
-    assert actual.shape == (768,)
-    torch.testing.assert_close(actual, expected, rtol=0., atol=0.)
-
-    # Files written before 'pool' existed were always 4x4.
-    legacy = SmallEncoder().eval()
-    assert legacy.pool == 4 and legacy.net[-3].in_features == 1024
-    legacy_path = tmp_path/'legacy.pt'
-    torch.save({'format': 'mario-student-v1', 'metadata': action_cache_metadata(70),
-                'weights': {k: v.detach().cpu() for k, v in legacy.state_dict().items()},
-                'metrics': {}}, legacy_path)
-    loaded = StudentEncoder(legacy_path)
-    assert loaded.model.pool == 4
-    with torch.no_grad():
-        torch.testing.assert_close(loaded.encode_frame(frame), legacy(preprocess(frame))[0], rtol=0., atol=0.)
-    # A legacy payload can't silently load into an 8x8 model.
-    with pytest.raises(RuntimeError):
-        SmallEncoder(pool=8).load_state_dict(torch.load(legacy_path, weights_only=True)['weights'])
-
-
-def test_distill_train_pool_flag_reaches_saved_student(tmp_path, monkeypatch):
+def test_distill_cli_pool_and_width_reach_train(tmp_path, monkeypatch):
     calls = []
+    monkeypatch.setattr(distill, 'ROOT', tmp_path)  # Default --output must not exist yet.
     monkeypatch.setattr(distill, 'train', lambda *args, **kwargs: calls.append((args, kwargs)))
-    monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train', '--pool', '8', '--data', str(tmp_path/'d.pt'),
+    monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train', '--data', str(tmp_path/'d.pt'),
                                       '--output', str(tmp_path/'s.pt')])
     distill.main()
-    assert calls == [((tmp_path/'d.pt', tmp_path/'s.pt', 60, 0, 8, 'impala', 1), {})]
-    monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train'])
+    assert calls == [((tmp_path/'d.pt', tmp_path/'s.pt', 60, 0, 8, 1), {})]
+    monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train', '--width', '1.5', '--pool', '4'])
     distill.main()
-    assert calls[-1][0][-3:] == (8, 'impala', 1)  # 8x8 IMPALA/1x is the default for new students.
-    monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train', '--arch', 'impala', '--width', '1.5', '--pool', '4'])
-    distill.main()
-    assert calls[-1][0][-3:] == (4, 'impala', 1.5)
-    monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train', '--arch', 'resnet'])
-    with pytest.raises(SystemExit):
+    assert calls[-1][0][-2:] == (4, 1.5)
+    monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train', '--arch', 'impala'])
+    with pytest.raises(SystemExit) as exit_info:  # --arch no longer exists.
         distill.main()
-    assert len(calls) == 3
+    assert exit_info.value.code == 2 and len(calls) == 2
 
 
-def test_distill_train_with_pool_8_saves_loadable_student(tmp_path, monkeypatch):
+def test_distill_train_saves_loadable_impala_student(tmp_path):
     from torch.nn import functional as F
     count = 64
     frames = torch.zeros(count, 240, 256, 3, dtype=torch.uint8)
@@ -279,11 +249,252 @@ def test_distill_train_with_pool_8_saves_loadable_student(tmp_path, monkeypatch)
     groups = torch.tensor([(i % 4, i // 16) for i in range(count)])
     data_path, student_path = tmp_path/'data.pt', tmp_path/'student.pt'
     torch.save(dict(frames=frames, targets=targets, groups=groups, metadata=action_cache_metadata(70)), data_path)
-    distill.train(data_path, student_path, epochs=1, pool=8)
-    assert torch.load(student_path, weights_only=True)['pool'] == 8
+    distill.train(data_path, student_path, epochs=1, pool=4, width=.5)
+    payload = torch.load(student_path, weights_only=True)
+    assert (payload['arch'], payload['pool'], payload['width']) == ('impala', 4, .5)
     student = StudentEncoder(student_path)
-    assert student.model.pool == 8
+    assert (student.model.pool, student.model.width) == (4, .5)
     assert student.encode_frame(np.zeros((240, 256, 3), dtype=np.uint8)).shape == (768,)
+
+
+@pytest.mark.parametrize(('command', 'flag'), [('collect', '--data'), ('train', '--output')])
+def test_distill_cli_refuses_to_overwrite_existing_output(tmp_path, monkeypatch, capsys, command, flag):
+    target = tmp_path/'existing.pt'
+    target.write_bytes(b'keep me')
+    monkeypatch.setattr(distill, 'ROOT', tmp_path)
+    for name in ('collect', 'train', 'benchmark'):
+        monkeypatch.setattr(distill, name, lambda *args, **kwargs: pytest.fail('Ran despite existing output'))
+    monkeypatch.setattr(sys, 'argv', ['mario-distill', command, flag, str(target)])
+    with pytest.raises(SystemExit) as exit_info:
+        distill.main()
+    assert exit_info.value.code == 2 and 'already exists' in capsys.readouterr().err
+    assert target.read_bytes() == b'keep me'
+
+
+def test_distill_cli_benchmark_accepts_existing_output(tmp_path, monkeypatch):
+    # Only collect/train are guarded; benchmark reads the existing --output student.
+    calls = []
+    output = tmp_path/'student.pt'
+    output.write_bytes(b'existing student')
+    monkeypatch.setattr(distill, 'ROOT', tmp_path)
+    monkeypatch.setattr(distill, 'benchmark', lambda *args: calls.append(args))
+    monkeypatch.setattr(sys, 'argv', ['mario-distill', 'benchmark', '--output', str(output)])
+    distill.main()
+    assert calls == [(tmp_path/'models/distillation/frames.pt', output, 'auto')]
+
+
+@pytest.mark.parametrize(('width', 'pool'), [(1, 8), (2, 8), (.5, 4)])
+def test_student_width_and_pool_roundtrip(tmp_path, width, pool):
+    torch.set_num_threads(1)
+    frame = np.zeros((240, 256, 3), dtype=np.uint8)
+    frame[100:140, 60:80] = (200, 50, 20)
+    model = StudentCNN(pool, width).eval()
+    assert any(isinstance(layer, torch.nn.MaxPool2d) for layer in model.net)
+    assert model.net[0].out_channels == round(16*width)
+    assert model.net[-3].in_features == round(64*width)*pool*pool
+    with torch.no_grad():
+        model.target_mean.normal_(generator=torch.Generator().manual_seed(3))
+        expected = model(preprocess(frame))[0]
+    assert expected.shape == (768,) and torch.isfinite(expected).all()
+    path = tmp_path/'student.pt'
+    save_student(model, path)
+    payload = torch.load(path, weights_only=True)
+    assert (payload['pool'], payload['arch'], payload['width']) == (pool, 'impala', float(width))
+    student = StudentEncoder(path)
+    assert (student.model.pool, student.model.width) == (pool, float(width))
+    torch.testing.assert_close(student.encode_frame(frame), expected, rtol=0., atol=0.)
+
+
+def test_student_payload_without_width_loads_as_width_1(tmp_path):
+    model = StudentCNN(4).eval()
+    path = tmp_path/'nowidth.pt'
+    torch.save({'format': 'mario-student-v1', 'metadata': action_cache_metadata(70), 'pool': 4, 'arch': 'impala',
+                'weights': {k: v.detach().cpu() for k, v in model.state_dict().items()}, 'metrics': {}}, path)
+    student = StudentEncoder(path)
+    assert (student.model.pool, student.model.width) == (4, 1.)
+    frame = np.zeros((240, 256, 3), dtype=np.uint8)
+    with torch.no_grad():
+        torch.testing.assert_close(student.encode_frame(frame), model(preprocess(frame))[0], rtol=0., atol=0.)
+
+
+@pytest.mark.parametrize('arch', ['missing', 'small', 'resnet', None])
+def test_student_encoder_rejects_non_impala_payloads(tmp_path, arch):
+    path = tmp_path/'student.pt'
+    save_student(StudentCNN(4), path)
+    payload = torch.load(path, weights_only=True)
+    if arch == 'missing':
+        del payload['arch']  # Files from before the arch key were the plain CNN.
+    else:
+        payload['arch'] = arch
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match='IMPALA'):
+        StudentEncoder(path)
+
+
+@pytest.mark.parametrize('width', [0, -1, .01, float('nan'), float('inf')])
+def test_invalid_student_width_raises(width):
+    with pytest.raises(ValueError):
+        StudentCNN(4, width)
+
+
+def test_smallest_valid_student_width_builds():
+    # round(16*width) >= 1 is the floor; 0.5 is the documented valid lower case.
+    for width in (.5, 1/16):
+        model = StudentCNN(4, width).eval()
+        with torch.no_grad():
+            assert model(preprocess(np.zeros((240, 256, 3), dtype=np.uint8))).shape == (1, 768)
+
+
+# --- CLI checkpoint guard and per-command defaults -------------------------------------------
+
+def run_defaults(monkeypatch, tmp_path, argv, payload=None):
+    """Run cli.main with fakes; report encoder choice, display, sleeps and started-event mode."""
+    import mario_embedding_agent.student as student_module
+    seen = {'frozen': 0, 'student': [], 'display': 0, 'sleeps': 0, 'calibrated': [], 'loads': []}
+
+    class Frozen(Encoder):
+        def __init__(self, *args, **kwargs):
+            seen['frozen'] += 1
+
+    class Student(Encoder):
+        fingerprint = 'fake-student'
+        def __init__(self, path, device='auto'):
+            seen['student'].append(path)
+
+    class FakeDisplay:
+        def __init__(self):
+            seen['display'] += 1
+        def draw(self, frame, policy_frame, lines):
+            return True
+        def close(self):
+            pass
+
+    class Env:
+        steps = 0
+        def reset(self, seed):
+            return np.zeros((240, 256, 3), dtype=np.uint8), {}
+        def close(self):
+            pass
+
+    def fake_step(environment, command):
+        environment.steps += 1
+        return np.zeros((240, 256, 3), dtype=np.uint8), environment.steps == 2
+
+    def calibrate(encoder, path):
+        seen['calibrated'].append(path)
+        return torch.zeros(768), torch.ones(768)
+
+    def load(path):
+        seen['loads'].append(path)
+        return payload
+
+    def sleep(_):
+        seen['sleeps'] += 1
+
+    monkeypatch.setattr(cli, 'ROOT', tmp_path)
+    monkeypatch.setattr(cli, 'FrozenEncoder', Frozen)
+    monkeypatch.setattr(student_module, 'StudentEncoder', Student)
+    monkeypatch.setattr(student_module, 'calibrate_policy_features', calibrate)
+    monkeypatch.setattr(cli, 'Display', FakeDisplay)
+    monkeypatch.setattr(cli, 'prepare_actions', lambda *args: torch.ones(18, 768))
+    monkeypatch.setattr(cli, 'make_env', Env)
+    monkeypatch.setattr(cli, 'step', fake_step)
+    monkeypatch.setattr(cli, 'update', lambda *args, **kwargs: {})
+    monkeypatch.setattr(cli.ActorCritic, 'act', lambda *args, **kwargs: (0, 0., 0., [1.] + [0.] * 17))
+    monkeypatch.setattr(cli.checkpoint, 'load', load)
+    monkeypatch.setattr(cli.checkpoint, 'save', lambda *args: None)
+    monkeypatch.setattr(cli.time, 'sleep', sleep)
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', *argv])
+    cli.main()
+    command = argv[0]
+    events = [json.loads(line) for line in (tmp_path/f'runs/{command}.jsonl').read_text().splitlines()]
+    seen['mode'] = next(event for event in events if event['event'] == 'started')['mode']
+    return seen
+
+
+def existing_checkpoint(tmp_path):
+    path = tmp_path/'checkpoints/latest.pt'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'original checkpoint bytes')
+    return path
+
+
+def test_fresh_train_refuses_to_overwrite_existing_checkpoint(monkeypatch, tmp_path, capsys):
+    path = existing_checkpoint(tmp_path)
+    monkeypatch.setattr(cli, 'ROOT', tmp_path)
+    monkeypatch.setattr(cli, 'FrozenEncoder', lambda *args, **kwargs: pytest.fail('Encoder built before guard'))
+    monkeypatch.setattr(cli.checkpoint, 'save', lambda *args: pytest.fail('Checkpoint overwritten'))
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--total-frames', '1'])
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 2
+    assert '--resume' in capsys.readouterr().err
+    assert path.read_bytes() == b'original checkpoint bytes'
+
+
+def test_resume_continues_the_existing_checkpoint(monkeypatch, tmp_path):
+    path = existing_checkpoint(tmp_path)
+    payload = legacy_payload({})
+    payload['config'].update(reward_version='visual-frontier-v5', stall_timeout_frames=TIMEOUT)
+    seen = run_defaults(monkeypatch, tmp_path, ['train', '--teacher', '--resume', '--total-frames', '1'], payload)
+    assert seen['loads'] == [path]
+    assert path.read_bytes() == b'original checkpoint bytes'  # save is faked; the guard didn't trip.
+
+
+@pytest.mark.parametrize('command', [['play'], ['evaluate'], ['train', '--resume']])
+def test_play_evaluate_and_resume_require_existing_checkpoint(monkeypatch, tmp_path, capsys, command):
+    monkeypatch.setattr(cli, 'ROOT', tmp_path)
+    monkeypatch.setattr(cli, 'FrozenEncoder', lambda *args, **kwargs: pytest.fail('Encoder built before guard'))
+    monkeypatch.setattr(cli.checkpoint, 'load', lambda *args: pytest.fail('Loaded a missing checkpoint'))
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', *command, '--teacher', '--checkpoint', str(tmp_path/'missing.pt')])
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 2
+    assert 'does not exist' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(('argv', 'mode', 'sleeps', 'display'), [
+    (['train', '--total-frames', '3'], 'sync', False, False),
+    (['train', '--total-frames', '3', '--show'], 'sync', False, True),
+    (['train', '--total-frames', '3', '--mode', 'realtime', '--fps', '30'], 'realtime', True, False),
+    (['train', '--total-frames', '3', '--mode', 'realtime'], 'realtime', True, False),  # fps defaults to 60.
+    (['evaluate', '--episodes', '1'], 'sync', False, False),
+    (['evaluate', '--episodes', '1', '--show'], 'sync', False, True),
+    (['play', '--total-frames', '3'], 'sync', True, True),
+    (['play', '--total-frames', '3', '--headless'], 'sync', True, False),
+    (['play', '--total-frames', '3', '--fps', '0'], 'sync', False, True),
+])
+def test_cli_defaults_per_command(monkeypatch, tmp_path, argv, mode, sleeps, display):
+    existing_checkpoint(tmp_path)
+    if argv[0] == 'train':
+        (tmp_path/'checkpoints/latest.pt').unlink()
+    seen = run_defaults(monkeypatch, tmp_path, [*argv, '--teacher'], legacy_payload({}))
+    assert seen['mode'] == mode
+    assert (seen['sleeps'] > 0) == sleeps  # fps 0 (train/evaluate default) never sleeps; play paces at 60.
+    assert seen['display'] == int(display)
+
+
+def test_student_encoder_is_default_and_teacher_flag_overrides(monkeypatch, tmp_path):
+    seen = run_defaults(monkeypatch, tmp_path, ['train', '--total-frames', '1'])
+    assert seen['student'] == [tmp_path/'models/distillation/student.pt'] and seen['frozen'] == 0
+    assert seen['calibrated'] == [tmp_path/'models/distillation/frames.pt']  # Fresh student MLP calibrates.
+    (tmp_path/'checkpoints/latest.pt').unlink(missing_ok=True)
+    seen = run_defaults(monkeypatch, tmp_path, ['train', '--total-frames', '1', '--teacher'])
+    assert seen['student'] == [] and seen['frozen'] == 1 and seen['calibrated'] == []
+
+
+def test_prepare_always_uses_teacher(monkeypatch, tmp_path):
+    import mario_embedding_agent.student as student_module
+    built = []
+    monkeypatch.setattr(cli, 'ROOT', tmp_path)
+    monkeypatch.setattr(cli, 'download_model', lambda directory: None)
+    monkeypatch.setattr(cli, 'FrozenEncoder', lambda *args, **kwargs: built.append('teacher') or Encoder())
+    monkeypatch.setattr(student_module, 'StudentEncoder', lambda *args, **kwargs: pytest.fail('Student used for prepare'))
+    monkeypatch.setattr(cli, 'prepare_actions', lambda *args: torch.ones(18, 768))
+    for extra in ([], ['--student-encoder', str(tmp_path/'s.pt')]):
+        monkeypatch.setattr(sys, 'argv', ['mario-agent', 'prepare', *extra])
+        cli.main()
+    assert built == ['teacher', 'teacher']
 
 
 @pytest.mark.parametrize('case', ['fresh_custom', 'fresh_default', 'resume'])
@@ -291,7 +502,7 @@ def test_student_mlp_calibrates_from_calibration_frames_only_when_fresh(monkeypa
     import mario_embedding_agent.student as student_module
     from mario_embedding_agent.policy import ActorCritic
     path = tmp_path/'student.pt'
-    save_student(SmallEncoder(), path)
+    save_student(StudentCNN(), path)
     cache = tmp_path/'models/action-embeddings.pt'
     cache.parent.mkdir()
     torch.save(dict(metadata=action_cache_metadata(70), embeddings=torch.ones(18, 768)), cache)
@@ -326,12 +537,14 @@ def test_student_mlp_calibrates_from_calibration_frames_only_when_fresh(monkeypa
     monkeypatch.setattr(cli.checkpoint, 'save', lambda p, policy, optimizer, config, state: saved.append(dict(config)))
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
     custom = tmp_path/'elsewhere/calibration.pt'
-    argv = ['mario-agent', 'train', '--student-encoder', str(path), '--headless', '--mode', 'sync',
+    argv = ['mario-agent', 'train', '--student-encoder', str(path), 
             '--total-frames', '1', '--policy-architecture', 'mlp']
     if case != 'fresh_default':
         argv += ['--calibration-frames', str(custom)]
     if case == 'resume':
-        argv += ['--resume', 'resume.pt']
+        argv += ['--resume']
+        (tmp_path/'checkpoints').mkdir()
+        (tmp_path/'checkpoints/latest.pt').write_bytes(b'placeholder')  # load is faked
     monkeypatch.setattr(sys, 'argv', argv)
     cli.main()
     expected = {'fresh_custom': [custom], 'fresh_default': [tmp_path/'models/distillation/frames.pt'],
@@ -340,53 +553,17 @@ def test_student_mlp_calibrates_from_calibration_frames_only_when_fresh(monkeypa
     assert saved[-1]['encoder_backend'] == 'student' and saved[-1]['policy_architecture'] == 'mlp'
 
 
-@pytest.mark.parametrize(('arch', 'width', 'pool'), [('impala', 1, 8), ('small', 2, 8), ('impala', .5, 4)])
-def test_student_arch_and_width_roundtrip(tmp_path, arch, width, pool):
-    torch.set_num_threads(1)
-    frame = np.zeros((240, 256, 3), dtype=np.uint8)
-    frame[100:140, 60:80] = (200, 50, 20)
-    model = SmallEncoder(pool, arch, width).eval()
-    with torch.no_grad():
-        model.target_mean.normal_(generator=torch.Generator().manual_seed(3))
-        expected = model(preprocess(frame))[0]
-    assert expected.shape == (768,) and torch.isfinite(expected).all()
-    if arch == 'impala':
-        assert any(isinstance(layer, torch.nn.MaxPool2d) for layer in model.net)
-    else:
-        assert model.net[0].out_channels == round(24*width)
-    path = tmp_path/'student.pt'
-    save_student(model, path)
-    payload = torch.load(path, weights_only=True)
-    assert (payload['pool'], payload['arch'], payload['width']) == (pool, arch, float(width))
-    student = StudentEncoder(path)
-    assert (student.model.pool, student.model.arch, student.model.width) == (pool, arch, float(width))
-    torch.testing.assert_close(student.encode_frame(frame), expected, rtol=0., atol=0.)
 
 
-def test_legacy_student_without_arch_or_width_loads_as_small_width_1(tmp_path):
-    legacy = SmallEncoder(8).eval()
-    path = tmp_path/'legacy.pt'
-    torch.save({'format': 'mario-student-v1', 'metadata': action_cache_metadata(70), 'pool': 8,
-                'weights': {k: v.detach().cpu() for k, v in legacy.state_dict().items()},
-                'metrics': {}}, path)
-    student = StudentEncoder(path)
-    assert (student.model.arch, student.model.width, student.model.pool) == ('small', 1., 8)
-    frame = np.zeros((240, 256, 3), dtype=np.uint8)
-    with torch.no_grad():
-        torch.testing.assert_close(student.encode_frame(frame), legacy(preprocess(frame))[0], rtol=0., atol=0.)
-
-
-@pytest.mark.parametrize(('arch', 'width'), [('resnet', 1), ('small', 0), ('impala', -1), ('impala', .01),
-                                             ('small', .01), ('small', float('nan')), ('impala', float('inf'))])
-def test_invalid_student_arch_or_width_raises(arch, width):
-    with pytest.raises(ValueError):
-        SmallEncoder(4, arch, width)
-
-
-@pytest.mark.parametrize('arch', ['small', 'impala'])
-def test_smallest_valid_student_width_builds(arch):
-    # round(16*width) >= 1 is the floor; 0.5 is the documented valid lower case.
-    for width in (.5, 1/16):
-        model = SmallEncoder(4, arch, width).eval()
-        with torch.no_grad():
-            assert model(preprocess(np.zeros((240, 256, 3), dtype=np.uint8))).shape == (1, 768)
+@pytest.mark.parametrize(('saved_backend', 'flags', 'message'), [
+    ('embeddinggemma2', [], r'trained with the teacher \(pass --teacher\)'),
+    ('student', ['--teacher'], r'trained with the student encoder \(omit --teacher\)'),
+])
+def test_resume_backend_mismatch_names_the_teacher_flag(monkeypatch, tmp_path, saved_backend, flags, message):
+    existing_checkpoint(tmp_path)
+    payload = legacy_payload({})
+    payload['config'].update(reward_version='visual-frontier-v5', stall_timeout_frames=TIMEOUT,
+                             encoder_backend=saved_backend,
+                             student_fingerprint='fake-student' if saved_backend == 'student' else None)
+    with pytest.raises(ValueError, match=message):
+        run_defaults(monkeypatch, tmp_path, ['train', '--resume', '--total-frames', '1', *flags], payload)

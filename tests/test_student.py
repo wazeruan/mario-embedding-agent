@@ -8,7 +8,7 @@ import torch
 from torch.nn import functional as F
 
 from mario_embedding_agent.encoder import action_cache_metadata, prepare_actions
-from mario_embedding_agent.student import SmallEncoder, StudentEncoder, preprocess, save_student
+from mario_embedding_agent.student import StudentCNN, StudentEncoder, preprocess, save_student
 from mario_embedding_agent import distill
 
 
@@ -24,7 +24,7 @@ def dataset(path, count=64):
 
 def test_student_normalized_embedding_roundtrip_fingerprint_and_teacher_free_inference(tmp_path, monkeypatch):
     torch.set_num_threads(1)
-    model = SmallEncoder().eval()
+    model = StudentCNN().eval()
     frame = np.zeros((240, 256, 3), dtype=np.uint8)
     with torch.no_grad():
         expected = model(preprocess(frame))[0]
@@ -55,7 +55,7 @@ def test_dataset_and_student_reject_teacher_metadata_mismatch(tmp_path, field):
     data_path = tmp_path/'data.pt'
     dataset(data_path)
     student_path = tmp_path/'student.pt'
-    save_student(SmallEncoder(), student_path)
+    save_student(StudentCNN(), student_path)
     for path, loader in [(data_path, distill.load_data), (student_path, StudentEncoder)]:
         payload = torch.load(path, weights_only=True)
         payload['metadata'][field] = 'wrong'
@@ -148,7 +148,7 @@ def test_cli_student_teacher_free_and_resume_backend_identity(monkeypatch, tmp_p
     from mario_embedding_agent import cli
     from mario_embedding_agent.policy import ActorCritic
     path = tmp_path/'student.pt'
-    save_student(SmallEncoder(), path)
+    save_student(StudentCNN(), path)
     fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
     cache = tmp_path/'models/action-embeddings.pt'
     cache.parent.mkdir()
@@ -194,10 +194,15 @@ def test_cli_student_teacher_free_and_resume_backend_identity(monkeypatch, tmp_p
     if not is_mlp:
         argv += ['--policy-architecture', 'mlp' if resume_kind == 'legacy_to_mlp' else 'legacy']
     if resume_kind not in ('fresh', 'fresh_mlp'):
-        argv += ['--resume', 'resume.pt']
+        argv += ['--resume']
+        (tmp_path/'checkpoints').mkdir()
+        (tmp_path/'checkpoints/latest.pt').write_bytes(b'placeholder')  # load is faked
     monkeypatch.setattr(sys, 'argv', argv)
     if resume_kind in ('teacher', 'different_student', 'legacy_to_mlp'):
-        with pytest.raises(ValueError, match='configuration is incompatible'):
+        expected_error = {'teacher': r'trained with the teacher \(pass --teacher\)',
+                          'different_student': 'different student encoder.*--student-encoder',
+                          'legacy_to_mlp': 'configuration is incompatible'}[resume_kind]
+        with pytest.raises(ValueError, match=expected_error):
             cli.main()
         assert not saved
     else:
@@ -213,7 +218,7 @@ def test_benchmark_is_embedding_fidelity_and_latency_without_gameplay_claim(tmp_
     import json
     data_path, path = tmp_path/'data.pt', tmp_path/'student.pt'
     dataset(data_path)
-    save_student(SmallEncoder().eval(), path)
+    save_student(StudentCNN().eval(), path)
     teacher = StudentEncoder(path)
     monkeypatch.setattr(distill, 'ROOT', tmp_path)
     monkeypatch.setattr(distill, 'FrozenEncoder', lambda *args, **kwargs: teacher)

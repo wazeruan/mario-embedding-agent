@@ -96,7 +96,7 @@ def test_cli_pipe_override_commands_match_selected_action_and_duration(monkeypat
     monkeypatch.setattr(cli, 'update', lambda *args, **kwargs: {})
     monkeypatch.setattr(cli.checkpoint, 'save', lambda *args: None)
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync',
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'sync',
                                     '--total-frames', str(17+expected_duration), '--rollout', '2'])
     cli.main()
     wanted = next(action for action in ACTIONS if action.name == selected).commands()[0]

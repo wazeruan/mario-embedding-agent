@@ -76,8 +76,9 @@ def test_evaluate_stops_after_death_count_without_training_or_final_reset(monkey
     monkeypatch.setattr(cli, 'update', lambda *args, **kwargs: updates.append(args))
     monkeypatch.setattr(cli.ActorCritic, 'act', lambda *args, **kwargs: (0, 0.0, 0.0, [1.0] + [0.0] * 17))
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'evaluate', '--headless',
-                                    '--episodes', '2', '--seed', '7', '--checkpoint', 'policy.pt'])
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'evaluate', '--teacher',
+                                    '--episodes', '2', '--seed', '7', '--checkpoint', str(tmp_path/'policy.pt')])
+    (tmp_path/'policy.pt').write_bytes(b'placeholder')  # load is faked
 
     cli.main()
 

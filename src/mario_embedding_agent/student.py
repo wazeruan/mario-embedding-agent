@@ -29,32 +29,24 @@ class ResidualBlock(nn.Module):
         return inputs + self.conv(inputs)
 
 
-class SmallEncoder(nn.Module):
-    ARCHITECTURES = ('small', 'impala')
+class StudentCNN(nn.Module):
+    """IMPALA CNN (Espeholt et al., 2018) predicting the teacher's 768-d embedding.
 
-    def __init__(self, pool=4, arch='small', width=1):
+    Each stage is conv, max-pool and two residual blocks. It replaced a plain
+    three-layer CNN after giving more level clears in PPO on two seeds.
+    """
+    def __init__(self, pool=8, width=1):
         super().__init__()
-        # Pool size sets spatial resolution: 4x4 cells (~60px tall) blur Mario's
-        # height above ground; 8x8 keeps it at a modest parameter cost.
-        if arch not in self.ARCHITECTURES or not math.isfinite(width) or round(16*width) < 1:
-            raise ValueError('Unknown student architecture, or width too small for one channel per layer.')
-        self.pool, self.arch, self.width = int(pool), arch, float(width)
-        if arch == 'small':
-            channels = [round(c*self.width) for c in (24, 48, 64)]
-            layers = [nn.Conv2d(3, channels[0], 5, 2, 2), nn.GELU(),
-                      nn.Conv2d(channels[0], channels[1], 3, 2, 1), nn.GELU(),
-                      nn.Conv2d(channels[1], channels[2], 3, 2, 1), nn.GELU()]
-        else:
-            # IMPALA CNN (Espeholt et al., 2018): conv, max-pool and two residual
-            # blocks per stage, the usual encoder for Atari/Procgen-style agents.
-            channels = [round(c*self.width) for c in (16, 32, 64)]
-            layers, previous = [], 3
-            for out in channels:
-                layers += [nn.Conv2d(previous, out, 3, 1, 1), nn.MaxPool2d(3, 2, 1),
-                           ResidualBlock(out), ResidualBlock(out)]
-                previous = out
-            layers.append(nn.ReLU())
-        self.net = nn.Sequential(*layers,
+        if not math.isfinite(width) or round(16*width) < 1:
+            raise ValueError('Student width must be finite and large enough for one channel per layer.')
+        self.pool, self.width = int(pool), float(width)
+        channels = [round(c*self.width) for c in (16, 32, 64)]
+        layers, previous = [], 3
+        for out in channels:
+            layers += [nn.Conv2d(previous, out, 3, 1, 1), nn.MaxPool2d(3, 2, 1),
+                       ResidualBlock(out), ResidualBlock(out)]
+            previous = out
+        self.net = nn.Sequential(*layers, nn.ReLU(),
             nn.AdaptiveAvgPool2d((self.pool, self.pool)), nn.Flatten(),
             nn.Linear(channels[-1]*self.pool*self.pool, 256), nn.GELU(), nn.Linear(256, 768))
         self.register_buffer('target_mean', torch.zeros(768))
@@ -72,7 +64,7 @@ def save_student(model, path, metrics=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.tmp')
     torch.save({'format': 'mario-student-v1', 'metadata': action_cache_metadata(70),
-                'pool': model.pool, 'arch': model.arch, 'width': model.width,
+                'pool': model.pool, 'arch': 'impala', 'width': model.width,
                 'weights': {k: v.detach().cpu() for k, v in model.state_dict().items()},
                 'metrics': metrics or {}}, temporary)
     temporary.replace(path)
@@ -87,8 +79,9 @@ class StudentEncoder:
         self.fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
         self.device = 'cpu' if device == 'auto' else device
         self.image_tokens = 70
-        self.model = SmallEncoder(payload.get('pool', 4), payload.get('arch', 'small'),
-                                  payload.get('width', 1)).to(self.device)
+        if payload.get('arch') != 'impala':
+            raise ValueError('Only IMPALA student encoders are supported; distill one with mario-distill train.')
+        self.model = StudentCNN(payload['pool'], payload.get('width', 1)).to(self.device)
         self.model.load_state_dict(payload['weights'])
         self.model.eval().requires_grad_(False)
 

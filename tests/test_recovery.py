@@ -87,7 +87,7 @@ def test_cli_four_stagnant_decisions_schedule_and_keep_recovery_until_escape(mon
     monkeypatch.setattr(cli, 'update', ppo)
     monkeypatch.setattr(cli.checkpoint, 'save', lambda *args: None)
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync',
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'sync',
                                     '--rollout', '2', '--total-frames',
                                     '45' if scenario != 'death' else '25'])
     cli.main()
@@ -148,7 +148,7 @@ def test_recovery_exits_after_two_progress_events_with_positive_window_net(monke
     monkeypatch.setattr(cli, 'update', lambda *args, **kwargs: {})
     monkeypatch.setattr(cli.checkpoint, 'save', lambda *args: None)
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync',
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--headless', '--mode', 'sync',
                                     '--rollout', '2', '--total-frames', '80'])
 
     cli.main()

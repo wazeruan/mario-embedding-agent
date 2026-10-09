@@ -79,31 +79,42 @@ def main():
     parser.add_argument('command', choices=['prepare', 'train', 'play', 'evaluate'])
     parser.add_argument('--device', default='auto')
     parser.add_argument('--policy-architecture', choices=['legacy', 'mlp'], help='Fresh runs default to mlp; resumes keep the saved architecture')
-    parser.add_argument('--student-encoder', type=Path, help='Distilled image encoder checkpoint; defaults to CPU')
+    parser.add_argument('--teacher', action='store_true',
+                        help='Encode frames with EmbeddingGemma-2 itself instead of the distilled student (much slower)')
+    parser.add_argument('--student-encoder', type=Path, default=ROOT/'models/distillation/student.pt',
+                        help='Distilled image encoder; runs on CPU')
     parser.add_argument('--calibration-frames', type=Path, default=ROOT/'models/distillation/frames.pt',
                         help='Distillation frames used to calibrate a fresh student policy')
-    parser.add_argument('--headless', action='store_true')
-    parser.add_argument('--mode', choices=['sync', 'realtime'],
-                        help='Emulator pacing; defaults to sync for evaluation and realtime otherwise')
-    parser.add_argument('--fps', type=float, default=60,
-                        help='Emulator pacing; 0 runs sync mode as fast as possible')
+    parser.add_argument('--headless', action='store_true', help='play without a window')
+    parser.add_argument('--show', action='store_true', help='train or evaluate with the game window')
+    parser.add_argument('--mode', choices=['sync', 'realtime'], default='sync',
+                        help='sync pauses the emulator while encoding; realtime keeps it at --fps')
+    parser.add_argument('--fps', type=float,
+                        help='Emulator pacing; 0 runs sync mode as fast as possible '
+                             '(default: 0 for train/evaluate, 60 for play)')
     parser.add_argument('--rollout', type=int, default=128)
     parser.add_argument('--total-frames', type=int, help='Explicit bounded diagnostic only; otherwise unbounded')
-    parser.add_argument('--resume', type=Path)
+    parser.add_argument('--resume', action='store_true', help='train: continue --checkpoint instead of starting fresh')
     parser.add_argument('--checkpoint', type=Path, default=ROOT/'checkpoints/latest.pt')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--episodes', type=int, default=10,
                         help='Death-ended evaluation attempts before stopping')
     args = parser.parse_args()
-    args.mode = args.mode or ('sync' if args.command == 'evaluate' else 'realtime')
+    if args.fps is None:
+        args.fps = 60.0 if args.command == 'play' or args.mode == 'realtime' else 0.0
+    args.headless = (args.headless if args.command == 'play' else not args.show)
+    if args.teacher or args.command == 'prepare':
+        args.student_encoder = None  # prepare always encodes action texts with the teacher
     if args.fps < 0 or args.rollout < 2 or (args.total_frames is not None and args.total_frames <= 0):
         parser.error('fps must be non-negative, rollout >= 2, total-frames positive')
     if args.fps == 0 and args.mode != 'sync':
         parser.error('--fps 0 (unthrottled) requires --mode sync; realtime inference would fall behind')
     if args.command == 'evaluate' and (args.episodes <= 0 or args.total_frames is not None):
         parser.error('evaluate requires positive --episodes and stops only at death, not by frame count')
-    if args.command == 'prepare' and args.student_encoder:
-        parser.error('prepare uses the teacher to encode action texts')
+    if args.command == 'train' and not args.resume and args.checkpoint.exists():
+        parser.error(f'{args.checkpoint} already exists. Continue it with --resume, or move it away to start fresh.')
+    if (args.command in ('play', 'evaluate') or args.resume) and not args.checkpoint.exists():
+        parser.error(f'{args.checkpoint} does not exist yet. Start training with `mario-agent train`.')
     directory = ROOT/'models/embeddinggemma-2'
     if args.command == 'prepare':
         download_model(directory)
@@ -116,7 +127,7 @@ def main():
     if args.command == 'prepare':
         print(f'Prepared {len(ACTIONS)} actions: {tuple(embeddings.shape)}')
         return
-    payload = checkpoint.load(args.resume or args.checkpoint) if args.resume or args.command in ('play', 'evaluate') else None
+    payload = checkpoint.load(args.checkpoint) if args.resume or args.command in ('play', 'evaluate') else None
     architecture = args.policy_architecture or (payload['config'].get('policy_architecture', 'legacy') if payload else 'mlp')
     config = {'reward_scale': 15.0, 'image_tokens': 70, 'seed': args.seed,
               'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
@@ -177,6 +188,12 @@ def main():
                                     old_entropy_coef != config['entropy_coef'])
         temporal_context_migrated = old_temporal_context != config['temporal_context']
         if {k: v for k, v in saved_config.items() if k != 'seed'} != {k: v for k, v in config.items() if k != 'seed'}:
+            if saved_config['encoder_backend'] != config['encoder_backend']:
+                raise ValueError(f'{args.checkpoint} was trained with the '
+                                 f'{"teacher (pass --teacher)" if saved_config["encoder_backend"] == "embeddinggemma2" else "student encoder (omit --teacher)"}.')
+            if saved_config['student_fingerprint'] != config['student_fingerprint']:
+                raise ValueError(f'{args.checkpoint} was trained with a different student encoder than '
+                                 f'{args.student_encoder}; pass the matching --student-encoder.')
             raise ValueError('Checkpoint training configuration is incompatible')
         config = saved_config
     torch.set_num_threads(1)
