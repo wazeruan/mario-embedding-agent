@@ -123,6 +123,7 @@ def main():
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
               'death_penalty': 15.0, 'clear_reward': 50.0, 'pixels_per_reward': 32.0,
               'progress_clip': 5.0, 'reward_version': 'visual-frontier-v5', 'stall_timeout_frames': 1800,
+              'restart_probability': 0.75, 'restart_backoff_px': 192.0, 'restart_snapshot_px': 64.0,
               'ppo_epochs': 4, 'ppo_minibatch_size': 32, 'target_kl': 0.02, 'value_clip': None,
               'discount_reference_frames': 20, 'optimizer_weight_decay': 0.0,
               'left_action_logit_bias': -3.0, 'entropy_coef': 0.01,
@@ -165,7 +166,8 @@ def main():
             'left_action_logit_bias', 'entropy_coef', 'temporal_context', 'stagnation_threshold',
             'stagnation_deadband_px', 'recovery_actions', 'recovery_logit_bias',
             'recovery_down_hold_frames', 'recovery_progress_px', 'recovery_progress_window',
-            'recovery_progress_events_required', 'recovery_window_net_progress_px', 'stall_timeout_frames')})
+            'recovery_progress_events_required', 'recovery_window_net_progress_px', 'stall_timeout_frames',
+            'restart_probability', 'restart_backoff_px', 'restart_snapshot_px')})
         recovery_behavior_migrated |= saved_config.get('pipe_recovery') != config['pipe_recovery']
         saved_config['pipe_recovery'] = config['pipe_recovery']
         saved_config.setdefault('gap_bonus', 1.0)
@@ -195,7 +197,7 @@ def main():
                                  weight_decay=config['optimizer_weight_decay'])
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
              'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0,
-             'stalls': 0, 'stall_frames': 0, 'stall_frontier_px': 0.0,
+             'stalls': 0, 'stall_frames': 0, 'stall_frontier_px': 0.0, 'restarts': 0,
              'stagnant_decisions': 0, 'recovery_active': False, 'recovery_action_index': 0,
              'recovery_progress_window': [], 'previous_features': None}
     if args.command == 'evaluate':
@@ -284,7 +286,7 @@ def main():
 
     def state_counts():
         return {**{k: state[k] for k in ('frames', 'decisions', 'updates', 'deaths', 'clears', 'gaps',
-                                      'stalls', 'stall_frames',
+                                      'stalls', 'stall_frames', 'restarts',
                                       'stagnant_decisions', 'recovery_active', 'recovery_action_index',
                                       'recovery_progress_window')},
                 'visual_position_px': frontier.position, 'visual_frontier_px': frontier.frontier}
@@ -292,6 +294,22 @@ def main():
     def save_checkpoint():
         state.update(visual_position_px=frontier.position, visual_frontier_px=frontier.frontier)
         checkpoint.save(args.checkpoint, policy, optimizer, config, state)
+
+    # Restart curriculum (training only): emulator snapshots taken every few pixels
+    # of new ground let a failed episode resume shortly before the place it died, so
+    # hard obstacles get many attempts without replaying the level from the start.
+    # Snapshots carry reward detectors and the controller-command prefix, so rewards
+    # are not paid twice and checkpoint replay still reconstructs the episode.
+    restarts_enabled = args.command == 'train' and config['restart_probability'] > 0
+    episode_snapshots = []
+    next_snapshot_px = config['restart_snapshot_px']
+
+    def capture_snapshot():
+        episode_snapshots.append(dict(
+            emulator=env.unwrapped.dump_state(), frame=frame.copy(),
+            commands=list(state['episode_commands']), seed=state['episode_seed'],
+            position=frontier.position, frontier=frontier.frontier,
+            motion=deepcopy(motion), detector=deepcopy(detector), gap_detector=deepcopy(gap_detector)))
 
     def reset_recovery():
         state['stagnant_decisions'] = 0
@@ -495,6 +513,9 @@ def main():
                 state['stall_frames'] += 1
             stalled = (args.command == 'train' and not died and not cleared and
                        state['stall_frames'] >= config['stall_timeout_frames'])
+            if restarts_enabled and not (died or cleared or stalled) and frontier.frontier >= next_snapshot_px:
+                capture_snapshot()
+                next_snapshot_px = frontier.frontier + config['restart_snapshot_px']
             if crossed and not died and not cleared and active is not None:
                 active['gap_bonus'] += config['gap_bonus']
                 state['gaps'] += 1
@@ -503,6 +524,7 @@ def main():
                 emit('gap_crossing', bonus=config['gap_bonus'], captured_frame=str(image_path))
             if died or cleared or stalled:
                 outcome = 'death' if died else 'stall' if stalled else 'clear'
+                ended_frontier = frontier.frontier
                 image_path = logdir/f'{outcome}-{state["frames"]}.png'
                 Image.fromarray(frame).save(image_path)
                 finish(reward(died or stalled, cleared, death_penalty=config['death_penalty'],
@@ -518,6 +540,9 @@ def main():
                 gap_detector = GapDetector()
                 if cleared:
                     motion.reset(frame)
+                    # Snapshots and their frontier coordinates belong to the finished level.
+                    episode_snapshots.clear()
+                    next_snapshot_px = config['restart_snapshot_px']
                 if died or stalled:
                     if args.command == 'evaluate':
                         evaluation['episodes'] += 1
@@ -553,12 +578,33 @@ def main():
                             evaluation['episode_raw_reward'] = 0.0
                             evaluation['episode_progress_px'] = 0.0
                     else:
-                        state['episode_seed'] += 1
-                        state['episode_commands'] = []
-                        frame, _ = env.reset(seed=state['episode_seed'])
-                        motion.reset(frame)
-                        detector = StageDetector()
-                        detector.observe(frame)
+                        candidates = [snap for snap in episode_snapshots
+                                      if snap['frontier'] <= ended_frontier - config['restart_backoff_px']]
+                        if (restarts_enabled and candidates and
+                                float(torch.rand(())) < config['restart_probability']):
+                            snapshot = candidates[-1]
+                            del episode_snapshots[episode_snapshots.index(snapshot)+1:]
+                            env.unwrapped.load_state(snapshot['emulator'])
+                            frame = snapshot['frame'].copy()
+                            state['episode_seed'] = snapshot['seed']
+                            state['episode_commands'] = list(snapshot['commands'])
+                            frontier.position = snapshot['position']
+                            frontier.frontier = state['stall_frontier_px'] = snapshot['frontier']
+                            motion = deepcopy(snapshot['motion'])
+                            detector = deepcopy(snapshot['detector'])
+                            gap_detector = deepcopy(snapshot['gap_detector'])
+                            next_snapshot_px = snapshot['frontier'] + config['restart_snapshot_px']
+                            state['restarts'] += 1
+                            emit('restart', from_frontier_px=snapshot['frontier'], ended_frontier_px=ended_frontier)
+                        else:
+                            state['episode_seed'] += 1
+                            state['episode_commands'] = []
+                            frame, _ = env.reset(seed=state['episode_seed'])
+                            motion.reset(frame)
+                            detector = StageDetector()
+                            detector.observe(frame)
+                            episode_snapshots.clear()
+                            next_snapshot_px = config['restart_snapshot_px']
             if stop_evaluation:
                 break
             if args.command == 'train' and save_due:
@@ -583,7 +629,7 @@ def main():
                          f'New ground {frontier.frontier:.0f}px',
                          f'Rollout {len(rollout)}/{args.rollout}, actor {metrics.get("actor_samples", 0)}',
                          f'Updates {state["updates"]} KL {metrics.get("final_kl", 0):.3g}',
-                         f'Dead {state["deaths"]} stalled {state["stalls"]} clear {state["clears"]} gaps {state["gaps"]}', f'Reward {last_reward:g} / {last_reward/config["reward_scale"]:g}',
+                         f'Dead {state["deaths"]} stalled {state["stalls"]} clear {state["clears"]} gaps {state["gaps"]} restarts {state["restarts"]}', f'Reward {last_reward:g} / {last_reward/config["reward_scale"]:g}',
                          *[f'{k}: {metrics[k]:.4g}' for k in ('policy_loss', 'value_loss', 'entropy', 'explained_variance') if isinstance(metrics.get(k), (float, int))],
                          'Recovery probabilities:' if active and active['recovery_action'] else 'Policy probabilities:',
                          *[f'{ACTIONS[i].name}: {probabilities[i]:.2f}' for i in sorted(range(len(probabilities)), key=lambda i: probabilities[i], reverse=True)[:3]],

@@ -105,6 +105,12 @@ Fresh student policies calibrate on `--calibration-frames` (default `models/dist
 
 Training ends an episode that reaches no new visual ground for 1,800 frames (30 s at 60 FPS) with outcome `stall`, the death penalty and a reset to the next seed. Without it, a policy stuck behind an obstacle waited about 8,000 frames for the game timer; that late penalty is nearly invisible after discounting and the frames are wasted. Evaluation and play never stall-terminate. The decision is based only on the RGB-derived frontier.
 
+### Restart curriculum
+
+Every attempt at a late obstacle used to cost a full run from the level start: a policy that reliably reached the staircase pit at ~2,390 px in World 1-1 got only 30–60 tries there per 100k frames. Training now captures an exact emulator snapshot (`dump_state`, ~0.04 ms) every 64 px of new visual ground. After a death or stall, with probability 0.75 it resumes from the latest snapshot at least 192 px before where the episode ended; otherwise it resets to the level start, so whole-level play keeps being practised. Snapshots carry the reward detectors and the controller-command prefix, so ground is not paid twice within an attempt and checkpoint replay reconstructs the restored episode. Level clears and full resets discard snapshots. Only RGB-derived progress chooses the restart point; evaluation and play never restart.
+
+Continuing a checkpoint stuck at that pit for 200k more frames (seed 0) gave 43 level clears with restarts versus 26 without; the estimated success rate at the pit rose from 27% to 39%. One seed and a short run: treat this as a sample-efficiency improvement, not a guarantee.
+
 ### Underground exit-pipe recovery
 
 The generic recovery cycle can leave Mario on top of the low pipe beside the underground room's green wall: a four-frame retreat followed by another right jump does not reliably clear the pipe. During stagnation, an RGB-only detector now recognizes the black room, tall right-side green wall, low adjoining pipe, and Mario sprite. It retreats left in 16-frame segments until Mario clears the edge, releases buttons in 8-frame segments while falling, then walks right in 24-frame segments into the pipe's left-facing side entrance. Each decision rechecks the screenshot; unsupported or ambiguous scenes retain generic recovery. No game metadata or additional rewards are used.
