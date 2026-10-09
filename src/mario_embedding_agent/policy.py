@@ -6,10 +6,14 @@ from torch.nn import functional as F
 from torch.distributions import Categorical
 from .actions import ACTIONS
 
+# Initial calibration statistics count as this many observations when merged
+# with running rollout statistics, so early rollouts refine rather than replace them.
+CALIBRATION_PRIOR_COUNT = 1024
+
 
 class ActorCritic(nn.Module):
     def __init__(self, action_embeddings, temperature=0.2, left_action_logit_bias=-3.0,
-                 architecture="legacy", feature_mean=None, feature_std=None):
+                 architecture="legacy", feature_mean=None, feature_std=None, feature_count=None):
         super().__init__()
         if architecture not in ('legacy', 'mlp'):
             raise ValueError('Unknown policy architecture.')
@@ -60,6 +64,9 @@ class ActorCritic(nn.Module):
                 raise ValueError('Expected finite 768-dimensional feature statistics with positive standard deviations.')
             self.register_buffer('feature_mean', mean)
             self.register_buffer('feature_std', std.clamp_min(1e-3))
+            if feature_count is None:
+                feature_count = 0 if feature_mean is None else CALIBRATION_PRIOR_COUNT
+            self.register_buffer('feature_count', torch.tensor(float(feature_count), dtype=torch.float64))
             self.nonlinear_actor = nn.Sequential(nn.LayerNorm(1536), nn.Linear(1536, 256), nn.GELU(),
                                                nn.Linear(256, 128), nn.GELU(), nn.Linear(128, len(vectors)))
             self.joint_critic = nn.Sequential(nn.LayerNorm(1536), nn.Linear(1536, 128), nn.GELU(),
@@ -111,6 +118,30 @@ class ActorCritic(nn.Module):
         if self.architecture == 'mlp':
             values = values + self.joint_critic(torch.cat((value_features, value_delta), dim=-1)).squeeze(-1)
         return logits, values
+
+    @torch.no_grad()
+    def update_feature_statistics(self, features):
+        """Merge a finished rollout into the running input statistics.
+
+        Frame embeddings are nearly collinear (pairwise cosine ~0.99), so the
+        nonlinear heads only see useful variation after standardization. Call
+        between PPO updates only: stored log-probabilities assume fixed statistics.
+        """
+        if self.architecture != 'mlp':
+            return
+        batch = F.normalize(torch.as_tensor(features, dtype=torch.float32).reshape(-1, 768), dim=-1)
+        added = batch.shape[0]
+        if added == 0:
+            return
+        count = float(self.feature_count)
+        total = count + added
+        batch_mean = batch.mean(0)
+        delta = batch_mean - self.feature_mean
+        variance = (self.feature_std.square() * count + batch.var(0, unbiased=False) * added +
+                    delta.square() * count * added / total) / total
+        self.feature_mean.add_(delta * added / total)
+        self.feature_std.copy_(variance.sqrt().clamp_min(1e-3))
+        self.feature_count.fill_(total)
 
     @torch.no_grad()
     def act(self, features, sample=True, action_bias=None, previous_features=None):

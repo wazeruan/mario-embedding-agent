@@ -90,11 +90,11 @@ def test_evaluate_stops_after_death_count_without_training_or_final_reset(monkey
     attempts = [event for event in events if event['event'] == 'evaluation_episode']
     assert [event['seed'] for event in attempts] == [7, 8]
     assert [event['frames'] for event in attempts] == [3, 3]
-    assert [event['raw_reward'] for event in attempts] == [-50.0, -50.0]
+    assert [event['raw_reward'] for event in attempts] == [-15.0, -15.0]
     complete = next(event for event in events if event['event'] == 'evaluation_complete')
     assert complete['complete'] is True
     assert complete['completed_episodes'] == 2
     assert complete['mean_frames'] == 3
-    assert complete['mean_raw_reward'] == -50
+    assert complete['mean_raw_reward'] == -15
     assert len(list((tmp_path/'runs').glob('death-*.png'))) == 2
 

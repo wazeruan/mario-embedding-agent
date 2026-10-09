@@ -86,13 +86,14 @@ import pytest
 
 
 @pytest.mark.parametrize(('cross_at', 'death_at', 'expected_rewards', 'expected_gaps', 'motion_value'),
-                         [(2, None, [.02, 0.], 1, 0.),
-                          (6, 8, [0., -1.], 1, 0.),
-                          (2, 2, [-1., 0.], 0, 0.),
-                          (2, None, [.0215, .0015], 1, .6),
-                          (2, None, [.02, 0.], 1, -.6),
-                          (6, 8, [.0015, -1.], 1, .6),
-                          (6, 'clear', [.0015, 1.], 1, .6)])
+                         # Raw rewards; the CLI divides them by reward_scale (15).
+                         [(2, None, [1., 0.], 1, 0.),
+                          (6, 8, [0., -15.], 1, 0.),
+                          (2, 2, [-15., 0.], 0, 0.),
+                          (2, None, [1.075, .075], 1, .6),
+                          (2, None, [1., 0.], 1, -.6),
+                          (6, 8, [.075, -15.], 1, .6),
+                          (6, 'clear', [.075, 50.], 1, .6)])
 def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
         monkeypatch, tmp_path, cross_at, death_at, expected_rewards, expected_gaps, motion_value):
     import copy
@@ -137,8 +138,8 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
         frame[0, 0, 0] = env.frames
         return frame, env.frames == death_at
     def fake_update(policy, optimizer, transitions, bootstrap, *, entropy_coef, **kwargs):
-        assert entropy_coef == .001
-        assert kwargs == dict(epochs=4, minibatch_size=16, target_kl=.02, reference_frames=20)
+        assert entropy_coef == .01
+        assert kwargs == dict(epochs=4, minibatch_size=32, target_kl=.02, reference_frames=20, value_clip=None)
         updates.append(copy.deepcopy(transitions))
         return {}
     monkeypatch.setattr(cli, 'ROOT', tmp_path)
@@ -156,6 +157,7 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
     monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--headless', '--mode', 'sync',
                                     '--total-frames', '10', '--rollout', '2'])
     cli.main()
+    expected_rewards = [value/15 for value in expected_rewards]
     assert [item.reward for item in updates[0]] == pytest.approx(expected_rewards)
     assert saved[-1]['gaps'] == expected_gaps
     events = [json.loads(line) for line in (tmp_path/'runs/train.jsonl').read_text().splitlines()]
@@ -163,13 +165,13 @@ def test_cli_attributes_bonus_to_active_decision_and_death_overrides(
     assert [event['scaled_reward'] for event in results[:2]] == pytest.approx(expected_rewards)
     assert all(event['action'] == 'idle' for event in results)
     assert all(event['duration_frames'] > 0 for event in results)
-    assert all(event['raw_reward']/50 == pytest.approx(event['scaled_reward']) for event in results)
+    assert all(event['raw_reward']/15 == pytest.approx(event['scaled_reward']) for event in results)
     if death_at == 'clear':
         clear_events = [event for event in results if event['outcome'] == 'level_clear']
         assert len(clear_events) == 1 and clear_events[0]['raw_reward'] == 50.
-        assert any(item.done and item.reward == 1. for item in updates[0])
+        assert any(item.done and item.reward == pytest.approx(50/15) for item in updates[0])
     elif death_at is not None:
         death_events = [event for event in results if event['outcome'] == 'death']
-        assert len(death_events) == 1 and death_events[0]['raw_reward'] == -50.
+        assert len(death_events) == 1 and death_events[0]['raw_reward'] == -15.
     if death_at is not None and death_at != 'clear':
         assert any(item.done and item.reward == -1. for item in updates[0])

@@ -40,7 +40,7 @@ def gae(transitions, bootstrap_value, gamma=0.99, gae_lambda=0.95, reference_fra
 
 def update(policy, optimizer, transitions, bootstrap_value, *, epochs=2, minibatch_size=8,
            gamma=0.99, gae_lambda=0.95, clip=0.2, value_coef=0.5, entropy_coef=0.01,
-           target_kl=0.02, reference_frames=20):
+           target_kl=0.02, reference_frames=20, value_clip=None):
     if not transitions:
         raise ValueError('Cannot update an empty rollout.')
     features = torch.stack([item.features.detach().clone() for item in transitions])
@@ -83,9 +83,13 @@ def update(policy, optimizer, transitions, bootstrap_value, *, epochs=2, minibat
             surrogate = torch.minimum(ratio * advantages[indices],
                                       ratio.clamp(1-clip, 1+clip) * advantages[indices])
             actor_loss = -surrogate[eligible].mean() if eligible.any() else logits.sum()*0
-            clipped_values = old_values[indices] + (values - old_values[indices]).clamp(-clip, clip)
-            critic_loss = 0.5 * torch.maximum((values - returns[indices]).square(),
-                                             (clipped_values - returns[indices]).square()).mean()
+            critic_loss = (values - returns[indices]).square()
+            if value_clip is not None:
+                # Optional PPO2-style value clipping; it slows critic fitting and
+                # is off by default (Andrychowicz et al., 2021).
+                clipped_values = old_values[indices] + (values - old_values[indices]).clamp(-value_clip, value_clip)
+                critic_loss = torch.maximum(critic_loss, (clipped_values - returns[indices]).square())
+            critic_loss = 0.5 * critic_loss.mean()
             entropy = dist.entropy()[eligible].mean() if eligible.any() else logits.sum()*0
             loss = actor_loss + value_coef * critic_loss - entropy_coef * entropy
             if not torch.isfinite(loss):

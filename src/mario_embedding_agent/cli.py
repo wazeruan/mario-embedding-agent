@@ -12,7 +12,7 @@ from .actions import ACTIONS
 from . import checkpoint
 from .encoder import FrozenEncoder, download_model, prepare_actions
 from .environment import make_env, step, COMMANDS
-from .policy import ActorCritic
+from .policy import ActorCritic, CALIBRATION_PRIOR_COUNT
 from .ppo import Transition, update
 from .rewards import StageDetector, GapDetector, RightwardProgress, ProgressFrontier, reward
 from .display import Display
@@ -36,15 +36,24 @@ def reset_critic_value_scale(policy, optimizer):
 
 
 def load_policy_weights(policy, weights):
-    """Allow a pre-temporal checkpoint to start with zeroed temporal adapters."""
+    """Allow a pre-temporal checkpoint to start with zeroed temporal adapters.
+
+    MLP checkpoints from before running input statistics lack `feature_count`:
+    calibrated statistics then count as a prior, identity statistics as none.
+    """
     result = policy.load_state_dict(weights, strict=False)
     allowed_missing = {name for name in policy.state_dict()
                        if name.startswith(('temporal_actor.', 'temporal_critic.'))}
     missing = set(result.missing_keys)
     unexpected = set(result.unexpected_keys)
+    statistics_missing = 'feature_count' in missing
+    missing.discard('feature_count')
     if (missing and missing != allowed_missing) or unexpected:
         raise ValueError(f'Checkpoint policy keys are incompatible: missing={sorted(missing)}, '
                          f'unexpected={sorted(unexpected)}')
+    if statistics_missing:
+        identity = bool((policy.feature_mean == 0).all() and (policy.feature_std == 1).all())
+        policy.feature_count.fill_(0 if identity else CALIBRATION_PRIOR_COUNT)
     return bool(missing)
 
 
@@ -74,8 +83,9 @@ def main():
     parser.add_argument('--headless', action='store_true')
     parser.add_argument('--mode', choices=['sync', 'realtime'],
                         help='Emulator pacing; defaults to sync for evaluation and realtime otherwise')
-    parser.add_argument('--fps', type=float, default=60)
-    parser.add_argument('--rollout', type=int, default=16)
+    parser.add_argument('--fps', type=float, default=60,
+                        help='Emulator pacing; 0 runs sync mode as fast as possible')
+    parser.add_argument('--rollout', type=int, default=128)
     parser.add_argument('--total-frames', type=int, help='Explicit bounded diagnostic only; otherwise unbounded')
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--checkpoint', type=Path, default=ROOT/'checkpoints/latest.pt')
@@ -84,8 +94,10 @@ def main():
                         help='Death-ended evaluation attempts before stopping')
     args = parser.parse_args()
     args.mode = args.mode or ('sync' if args.command == 'evaluate' else 'realtime')
-    if args.fps <= 0 or args.rollout < 2 or (args.total_frames is not None and args.total_frames <= 0):
-        parser.error('fps must be positive, rollout >= 2, total-frames positive')
+    if args.fps < 0 or args.rollout < 2 or (args.total_frames is not None and args.total_frames <= 0):
+        parser.error('fps must be non-negative, rollout >= 2, total-frames positive')
+    if args.fps == 0 and args.mode != 'sync':
+        parser.error('--fps 0 (unthrottled) requires --mode sync; realtime inference would fall behind')
     if args.command == 'evaluate' and (args.episodes <= 0 or args.total_frames is not None):
         parser.error('evaluate requires positive --episodes and stops only at death, not by frame count')
     if args.command == 'prepare' and args.student_encoder:
@@ -104,14 +116,14 @@ def main():
         return
     payload = checkpoint.load(args.resume or args.checkpoint) if args.resume or args.command in ('play', 'evaluate') else None
     architecture = args.policy_architecture or (payload['config'].get('policy_architecture', 'legacy') if payload else 'mlp')
-    config = {'reward_scale': 50.0, 'image_tokens': 70, 'seed': args.seed,
+    config = {'reward_scale': 15.0, 'image_tokens': 70, 'seed': args.seed,
               'environment': 'SuperMarioBros-full-pixel-v1', 'learning_rate': 3e-4,
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
-              'death_penalty': 50.0, 'clear_reward': 50.0, 'pixels_per_reward': 32.0,
-              'progress_clip': 5.0, 'reward_version': 'visual-frontier-v3',
-              'ppo_epochs': 4, 'ppo_minibatch_size': 16, 'target_kl': 0.02,
+              'death_penalty': 15.0, 'clear_reward': 50.0, 'pixels_per_reward': 32.0,
+              'progress_clip': 5.0, 'reward_version': 'visual-frontier-v4',
+              'ppo_epochs': 4, 'ppo_minibatch_size': 32, 'target_kl': 0.02, 'value_clip': None,
               'discount_reference_frames': 20, 'optimizer_weight_decay': 0.0,
-              'left_action_logit_bias': -3.0, 'entropy_coef': 0.001,
+              'left_action_logit_bias': -3.0, 'entropy_coef': 0.01,
               'temporal_context': 'previous-embedding-delta-v1',
               'stagnation_threshold': 4, 'stagnation_deadband_px': 1.0,
               'recovery_actions': ['down', 'run_left', 'run_right_jump_long', 'right_jump_short'],
@@ -119,7 +131,7 @@ def main():
               'recovery_progress_px': 8.0, 'recovery_progress_window': 4,
               'recovery_progress_events_required': 2, 'recovery_window_net_progress_px': 8.0, 'pipe_recovery': 'rgb-side-entry-v1'}
     config['policy_architecture'] = architecture
-    config['feature_standardization'] = 'student-output-train-stats-v1' if architecture == 'mlp' and args.student_encoder else 'identity'
+    config['feature_standardization'] = 'running-rollout-v1' if architecture == 'mlp' else 'identity'
     config['encoder_backend'] = 'student' if args.student_encoder else 'embeddinggemma2'
     config['student_fingerprint'] = encoder.fingerprint if args.student_encoder else None
     reward_objective_migrated = False
@@ -146,7 +158,8 @@ def main():
             saved_config.pop(key, None)
         saved_config.update({key: config[key] for key in (
             'reward_scale', 'death_penalty', 'clear_reward', 'pixels_per_reward', 'progress_clip', 'reward_version',
-            'ppo_epochs', 'ppo_minibatch_size', 'target_kl', 'discount_reference_frames', 'optimizer_weight_decay',
+            'ppo_epochs', 'ppo_minibatch_size', 'target_kl', 'value_clip', 'discount_reference_frames',
+            'optimizer_weight_decay', 'feature_standardization',
             'left_action_logit_bias', 'entropy_coef', 'temporal_context', 'stagnation_threshold',
             'stagnation_deadband_px', 'recovery_actions', 'recovery_logit_bias',
             'recovery_down_hold_frames', 'recovery_progress_px', 'recovery_progress_window',
@@ -347,11 +360,23 @@ def main():
         active = None
         if len(rollout) >= args.rollout:
             update_started = time.perf_counter()
+            rollout_features = torch.stack([item.features for item in rollout])
+            seeded_statistics = payload is None and float(getattr(policy, 'feature_count', 1)) == 0
+            if seeded_statistics:
+                # Fresh run: zero-initialized output layers make logits/values independent
+                # of statistics, so seeding them now keeps stored log-probs valid and the
+                # first update already trains on standardized inputs.
+                policy.update_feature_statistics(rollout_features)
             metrics = update(policy, optimizer, rollout, bootstrap,
                              entropy_coef=config['entropy_coef'], epochs=config['ppo_epochs'],
                              minibatch_size=config['ppo_minibatch_size'], target_kl=config['target_kl'],
-                             reference_frames=config['discount_reference_frames'])
+                             reference_frames=config['discount_reference_frames'],
+                             value_clip=config['value_clip'])
+            # Statistics change only between updates, after old log-probs are consumed.
+            if not seeded_statistics:
+                policy.update_feature_statistics(rollout_features)
             metrics['update_ms'] = (time.perf_counter()-update_started)*1000
+            metrics['feature_count'] = int(getattr(policy, 'feature_count', 0))
             rollout.clear()
             state['updates'] += 1
             save_due = True
@@ -552,8 +577,9 @@ def main():
             if time.perf_counter()-last_report >= 2:
                 print(f'frames={state["frames"]} fps={fps:.1f} decisions/s={dps:.2f} updates={state["updates"]} deaths={state["deaths"]} reward={last_reward:g}', flush=True)
                 last_report = time.perf_counter()
-            next_tick = max(next_tick + 1/args.fps, time.perf_counter())
-            time.sleep(max(0, next_tick-time.perf_counter()))
+            if args.fps > 0:
+                next_tick = max(next_tick + 1/args.fps, time.perf_counter())
+                time.sleep(max(0, next_tick-time.perf_counter()))
     except KeyboardInterrupt:
         pass
     finally:

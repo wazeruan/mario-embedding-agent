@@ -272,7 +272,7 @@ def test_initial_inference_wait_progress_is_explored_but_not_paid_to_first_actio
     assert commands[:3] == [()] * 3
     assert commands[3:7] == [('right',)] * 4
     assert [item.duration_frames for item in transitions] == [4, 4]
-    assert [item.reward for item in transitions] == pytest.approx([4./32./50., 0.])
+    assert [item.reward for item in transitions] == pytest.approx([4./32./15., 0.])
     events = [json.loads(line) for line in (tmp_path/'runs/train.jsonl').read_text().splitlines()]
     first_decision = next(event for event in events if event['event'] == 'decision')
     assert first_decision['visual_position_px'] == first_decision['visual_frontier_px'] == 3.

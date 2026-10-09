@@ -197,24 +197,25 @@ def test_cli_migrates_legacy_reward_config_preserving_weights_and_counters(monke
                                     '--total-frames', '1', '--resume', 'legacy.pt'])
     cli.main()
     config, state, weights, optimizer = saved[-1]
-    assert config['reward_scale'] == 50.
+    assert config['reward_scale'] == 15.
     assert config['encoder_backend'] == 'embeddinggemma2'
     assert config['policy_architecture'] == 'legacy'
     assert config['feature_standardization'] == 'identity'
     assert config['student_fingerprint'] is None
-    assert config['death_penalty'] == 50.
+    assert config['death_penalty'] == 15.
     assert config['clear_reward'] == 50.
     assert config['ppo_epochs'] == 4
-    assert config['ppo_minibatch_size'] == 16
+    assert config['ppo_minibatch_size'] == 32
+    assert config['value_clip'] is None
     assert config['target_kl'] == .02
     assert config['discount_reference_frames'] == 20
     assert config['optimizer_weight_decay'] == 0.
     assert config['pixels_per_reward'] == 32.
     assert config['progress_clip'] == 5.
-    assert config['reward_version'] == 'visual-frontier-v3'
+    assert config['reward_version'] == 'visual-frontier-v4'
     assert config['gap_bonus'] == 1.
     assert config['left_action_logit_bias'] == -3.
-    assert config['entropy_coef'] == .001
+    assert config['entropy_coef'] == .01
     assert config['stagnation_threshold'] == 4
     assert config['stagnation_deadband_px'] == 1.
     assert config['recovery_logit_bias'] == 8.
