@@ -31,8 +31,7 @@ class StageDetector:
         self.count = 0
 
     def observe(self, frame):
-        white = np.all(frame >= 235, axis=2)
-        label = white[24:32, 152:176]
+        label = np.all(frame[24:32, 152:176] >= 235, axis=2)
         # WORLD's numeric label is digit, hyphen, digit in the original RGB HUD.
         if (label.shape != (8, 24) or label[:, :8].sum() < 5 or
                 label[:, 16:].sum() < 5 or not label[3:5, 9:15].all()):
@@ -89,9 +88,10 @@ class GapDetector:
 
     @classmethod
     def mario(cls, frame):
-        red = np.all(frame == cls.RED, axis=2)
-        red[:48] = False
-        ys, xs = np.where(red)
+        # Filter on the red channel first; full RGB comparison only on candidates.
+        ys, xs = np.nonzero(frame[48:, :, 0] == cls.RED[0])
+        exact = (frame[48+ys, xs, 1] == cls.RED[1]) & (frame[48+ys, xs, 2] == cls.RED[2])
+        ys, xs = ys[exact]+48, xs[exact]
         if len(xs) < 5 or xs.max()-xs.min() > 24 or ys.max()-ys.min() > 30:
             return None
         x0, x1 = max(0, xs.min()-6), min(256, xs.max()+7)
@@ -165,14 +165,14 @@ class RightwardProgress:
     @staticmethod
     def _scene_scroll(previous, current):
         # Compare the textured ground strip; positive d means ground moved left.
-        a, b = previous[208:240], current[208:240]
+        a, b = previous[208:240].astype(np.int16), current[208:240].astype(np.int16)
         scores = []
         for d in range(-8, 9):
             if d >= 0:
                 old, new = a[:, d:], b[:, :256-d]
             else:
                 old, new = a[:, :256+d], b[:, -d:]
-            error = float(np.abs(old.astype(np.int16)-new.astype(np.int16)).mean())
+            error = float(np.abs(old-new).mean())
             scores.append((error, d))
         scores.sort()
         zero_error = next(error for error, shift in scores if shift == 0)
