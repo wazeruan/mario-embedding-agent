@@ -257,10 +257,17 @@ def test_distill_train_pool_flag_reaches_saved_student(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train', '--pool', '8', '--data', str(tmp_path/'d.pt'),
                                       '--output', str(tmp_path/'s.pt')])
     distill.main()
-    assert calls == [((tmp_path/'d.pt', tmp_path/'s.pt', 60, 0, 8), {})]
+    assert calls == [((tmp_path/'d.pt', tmp_path/'s.pt', 60, 0, 8, 'impala', 1), {})]
     monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train'])
     distill.main()
-    assert calls[-1][0][-1] == 8  # 8x8 is the default for newly trained students.
+    assert calls[-1][0][-3:] == (8, 'impala', 1)  # 8x8 IMPALA/1x is the default for new students.
+    monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train', '--arch', 'impala', '--width', '1.5', '--pool', '4'])
+    distill.main()
+    assert calls[-1][0][-3:] == (4, 'impala', 1.5)
+    monkeypatch.setattr(sys, 'argv', ['mario-distill', 'train', '--arch', 'resnet'])
+    with pytest.raises(SystemExit):
+        distill.main()
+    assert len(calls) == 3
 
 
 def test_distill_train_with_pool_8_saves_loadable_student(tmp_path, monkeypatch):
@@ -331,3 +338,55 @@ def test_student_mlp_calibrates_from_calibration_frames_only_when_fresh(monkeypa
                 'resume': []}[case]
     assert calls == expected
     assert saved[-1]['encoder_backend'] == 'student' and saved[-1]['policy_architecture'] == 'mlp'
+
+
+@pytest.mark.parametrize(('arch', 'width', 'pool'), [('impala', 1, 8), ('small', 2, 8), ('impala', .5, 4)])
+def test_student_arch_and_width_roundtrip(tmp_path, arch, width, pool):
+    torch.set_num_threads(1)
+    frame = np.zeros((240, 256, 3), dtype=np.uint8)
+    frame[100:140, 60:80] = (200, 50, 20)
+    model = SmallEncoder(pool, arch, width).eval()
+    with torch.no_grad():
+        model.target_mean.normal_(generator=torch.Generator().manual_seed(3))
+        expected = model(preprocess(frame))[0]
+    assert expected.shape == (768,) and torch.isfinite(expected).all()
+    if arch == 'impala':
+        assert any(isinstance(layer, torch.nn.MaxPool2d) for layer in model.net)
+    else:
+        assert model.net[0].out_channels == round(24*width)
+    path = tmp_path/'student.pt'
+    save_student(model, path)
+    payload = torch.load(path, weights_only=True)
+    assert (payload['pool'], payload['arch'], payload['width']) == (pool, arch, float(width))
+    student = StudentEncoder(path)
+    assert (student.model.pool, student.model.arch, student.model.width) == (pool, arch, float(width))
+    torch.testing.assert_close(student.encode_frame(frame), expected, rtol=0., atol=0.)
+
+
+def test_legacy_student_without_arch_or_width_loads_as_small_width_1(tmp_path):
+    legacy = SmallEncoder(8).eval()
+    path = tmp_path/'legacy.pt'
+    torch.save({'format': 'mario-student-v1', 'metadata': action_cache_metadata(70), 'pool': 8,
+                'weights': {k: v.detach().cpu() for k, v in legacy.state_dict().items()},
+                'metrics': {}}, path)
+    student = StudentEncoder(path)
+    assert (student.model.arch, student.model.width, student.model.pool) == ('small', 1., 8)
+    frame = np.zeros((240, 256, 3), dtype=np.uint8)
+    with torch.no_grad():
+        torch.testing.assert_close(student.encode_frame(frame), legacy(preprocess(frame))[0], rtol=0., atol=0.)
+
+
+@pytest.mark.parametrize(('arch', 'width'), [('resnet', 1), ('small', 0), ('impala', -1), ('impala', .01),
+                                             ('small', .01), ('small', float('nan')), ('impala', float('inf'))])
+def test_invalid_student_arch_or_width_raises(arch, width):
+    with pytest.raises(ValueError):
+        SmallEncoder(4, arch, width)
+
+
+@pytest.mark.parametrize('arch', ['small', 'impala'])
+def test_smallest_valid_student_width_builds(arch):
+    # round(16*width) >= 1 is the floor; 0.5 is the documented valid lower case.
+    for width in (.5, 1/16):
+        model = SmallEncoder(4, arch, width).eval()
+        with torch.no_grad():
+            assert model(preprocess(np.zeros((240, 256, 3), dtype=np.uint8))).shape == (1, 768)

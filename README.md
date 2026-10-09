@@ -101,6 +101,23 @@ uv run mario-agent train --student-encoder models/distillation/student-6k-p8.pt 
 
 Fresh student policies calibrate on `--calibration-frames` (default `models/distillation/frames.pt`); use the set the student was distilled on.
 
+### Student CNN architecture (2026-10-09)
+
+Three students were distilled on the same 6,144-frame set and trained with PPO for 300k frames (sync, unthrottled, current defaults including restarts):
+
+| Student | Params | CPU ms/frame | Std. RMSE vs teacher | Seed 0 clears | Seed 1 clears |
+|---|---|---|---|---|---|
+| small, 24/48/64 channels, 8×8 pool | 1.29M | 0.8 | 0.536 | 26 | 14 |
+| small, 2× width | 2.45M | 1.2 | 0.533 | 26 | — |
+| IMPALA CNN, 16/32/64, 8×8 pool | 1.46M | 2.7 | 0.532 | **42** | **22** |
+
+All three imitate the teacher about equally and match it on the linear probes; doubling width gave nothing. The IMPALA encoder (conv, max-pool and two residual blocks per stage; Espeholt et al., 2018) gave more level clears on both seeds and a better-fitting critic (late explained variance 0.55–0.59 vs 0.13–0.35). `mario-distill train` now defaults to `--arch impala`; `--arch small` and `--width` remain available, and existing student files load with their saved architecture.
+
+```sh
+uv run mario-distill train --data models/distillation/frames-6k.pt --output models/distillation/student-6k-impala.pt
+uv run mario-agent train --student-encoder models/distillation/student-6k-impala.pt --calibration-frames models/distillation/frames-6k.pt --mode sync --headless --fps 0 --checkpoint checkpoints/student-impala.pt
+```
+
 ### Stall timeout
 
 Training ends an episode that reaches no new visual ground for 1,800 frames (30 s at 60 FPS) with outcome `stall`, the death penalty and a reset to the next seed. Without it, a policy stuck behind an obstacle waited about 8,000 frames for the game timer; that late penalty is nearly invisible after discounting and the frames are wasted. Evaluation and play never stall-terminate. The decision is based only on the RGB-derived frontier.
