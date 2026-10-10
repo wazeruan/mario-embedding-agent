@@ -147,7 +147,7 @@ def test_death_restores_latest_snapshot_at_least_backoff_before_death(monkeypatc
     assert restart['restarts'] == 1 and restart['deaths'] == 1
     assert restart['visual_frontier_px'] == 128. and restart['visual_position_px'] == 128.
     config, state = saved[-1]
-    assert (config['restart_probability'], config['restart_backoff_px'], config['restart_snapshot_px']) == (.75, 192., 64.)
+    assert (config['restart_probability'], config['restart_backoff_px'], config['restart_snapshot_px']) == (.5, 192., 64.)
     assert state['restarts'] == 1 and state['deaths'] == 1
     assert state['episode_seed'] == 0  # Same episode, no seed advance.
     # Restored command prefix + 10 new frames reconstructs the emulator state exactly.
@@ -293,7 +293,7 @@ def test_old_checkpoint_without_restart_keys_resumes_and_restarts(monkeypatch, t
     started, = kinds(events, 'started')
     assert started['restarts'] == 0 and started['reward_objective_migrated'] is False
     config, state = saved[-1]
-    assert (config['restart_probability'], config['restart_backoff_px'], config['restart_snapshot_px']) == (.75, 192., 64.)
+    assert (config['restart_probability'], config['restart_backoff_px'], config['restart_snapshot_px']) == (.5, 192., 64.)
     assert state['restarts'] == 1 and state['deaths'] == 3 and state['frames'] == 440
     assert env.loads == [128] and env.resets == [3] and state['episode_seed'] == 3
     assert state['episode_commands'] == env.path
@@ -350,3 +350,34 @@ def test_real_emulator_snapshot_restore_matches_command_replay():
         np.testing.assert_array_equal(frames[-1], restored[-1])
     finally:
         fresh.close()
+
+
+def test_best_window_counts_only_attempts_that_began_at_level_start(monkeypatch, tmp_path):
+    # Death at 330 (from start, counted 0) -> restart at 128 (no longer from start).
+    # Death at 360: frontier 158 has no snapshot 192px back -> full reset, not counted.
+    # Death at 380 in the fresh episode (from start) is counted.
+    env, events, saved, _ = run(monkeypatch, tmp_path, train_argv(385), died=at_total(330, 360, 380))
+    assert env.loads == [128] and env.resets == [0, 1, 2]
+    restart, = kinds(events, 'restart')
+    state = saved[-1][1]
+    assert state['deaths'] == 3 and state['restarts'] == 1
+    assert state['recent_full_start_clears'] == [0, 0]
+    assert state['episode_from_start'] is True  # Set again by the last full reset.
+
+
+def test_restart_leaves_episode_not_from_start(monkeypatch, tmp_path):
+    env, _, saved, _ = run(monkeypatch, tmp_path, train_argv(340), died=at_total(330))
+    assert env.loads == [128]
+    state = saved[-1][1]
+    assert state['recent_full_start_clears'] == [0] and state['episode_from_start'] is False
+
+
+def test_level_clear_records_one_and_stops_counting_the_continuation(monkeypatch, tmp_path):
+    # Clear at 200 counts 1; the continuation into the next level dies at 260 (post-clear
+    # frontier 60, no snapshot -> full reset) and is not counted; the next episode is.
+    env, _, saved, _ = run(monkeypatch, tmp_path, train_argv(290), cleared=at_total(200),
+                           died=at_total(260, 285))
+    assert env.loads == [] and env.resets == [0, 1, 2]
+    state = saved[-1][1]
+    assert state['clears'] == 1 and state['deaths'] == 2
+    assert state['recent_full_start_clears'] == [1, 0] and state['episode_from_start'] is True

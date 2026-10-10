@@ -34,7 +34,7 @@ class Env:
         pass
 
 
-def run(monkeypatch, tmp_path, argv, *, motion=None, death_at=(), clear_at=(), payload=None):
+def run(monkeypatch, tmp_path, argv, *, motion=None, death_at=(), clear_at=(), payload=None, update=None):
     """Drive cli.main with fake pixels. motion maps global step -> displacement px."""
     env = Env()
     motion = motion or {}
@@ -73,10 +73,13 @@ def run(monkeypatch, tmp_path, argv, *, motion=None, death_at=(), clear_at=(), p
     monkeypatch.setattr(cli, 'RightwardProgress', Motion)
     monkeypatch.setattr(cli, 'step', fake_step)
     monkeypatch.setattr(cli, 'Transition', record_transition)
-    monkeypatch.setattr(cli, 'update', lambda *args, **kwargs: {})
+    monkeypatch.setattr(cli, 'update', update or (lambda *args, **kwargs: {}))
     monkeypatch.setattr(cli.ActorCritic, 'act', lambda *args, **kwargs: (0, 0., 0., [1.] + [0.] * 17))
-    monkeypatch.setattr(cli.checkpoint, 'save',
-                        lambda path, policy, optimizer, config, state: saved.append((copy.deepcopy(config), copy.deepcopy(state))))
+    env.save_paths = []
+    def save(path, policy, optimizer, config, state):
+        env.save_paths.append(path)
+        saved.append((copy.deepcopy(config), copy.deepcopy(state)))
+    monkeypatch.setattr(cli.checkpoint, 'save', save)
     if payload is not None:
         monkeypatch.setattr(cli.checkpoint, 'load', lambda path: payload)
     monkeypatch.setattr(cli.time, 'sleep', lambda _: None)
@@ -567,3 +570,268 @@ def test_resume_backend_mismatch_names_the_teacher_flag(monkeypatch, tmp_path, s
                              student_fingerprint='fake-student' if saved_backend == 'student' else None)
     with pytest.raises(ValueError, match=message):
         run_defaults(monkeypatch, tmp_path, ['train', '--resume', '--total-frames', '1', *flags], payload)
+
+
+# --- Adaptive entropy coefficient -------------------------------------------------------------
+
+def scripted_update(results):
+    """Fake PPO update returning scripted metrics; records the entropy_coef each call used."""
+    used = []
+    def update(policy, optimizer, rollout, bootstrap, *, entropy_coef, **kwargs):
+        used.append(entropy_coef)
+        return dict(results[len(used)-1]) if len(used) <= len(results) else {}
+    return update, used
+
+
+def test_entropy_coef_adapts_toward_target_and_clamps(monkeypatch, tmp_path):
+    import math
+    # The adaptation reads the actor-only entropy; recovery-only updates report it as None.
+    results = [{'actor_samples': 4, 'actor_entropy': .1},                     # below target 0.5 -> rises
+               {'actor_samples': 0, 'actor_entropy': None, 'entropy': -10.},  # recovery-only -> unchanged
+               {'actor_samples': 4, 'actor_entropy': -10.},                   # far below -> clamps at 0.1
+               {'actor_samples': 4, 'actor_entropy': 5.},                     # above -> falls
+               {'actor_samples': 4, 'actor_entropy': 5.},                     # below floor -> clamps at 0.01
+               {'actor_samples': 4, 'entropy': -10.}]                         # no actor entropy -> unchanged
+    update, used = scripted_update(results)
+    _, events, _, saved = run(monkeypatch, tmp_path, ['train', '--total-frames', '200', '--rollout', '2'],
+                              update=update)
+    assert len(used) > len(results)
+    risen = .01*math.exp(.5*(.5-.1))
+    expected = [.01, risen, risen, .1, .1*math.exp(.5*(.5-5.)), .01, .01]
+    assert used[:7] == pytest.approx(expected)
+    logged = [event['entropy_coef'] for event in events if event['event'] == 'ppo']
+    assert logged[:7] == pytest.approx(expected)  # Logs the coefficient that update used.
+    config, state = saved[-1]
+    assert (config['entropy_target'], config['entropy_coef_max'], config['entropy_adapt_rate']) == (.5, .1, .5)
+    assert config['entropy_coef'] == .01  # Floor stays the configured base value.
+    assert state['entropy_coef'] == pytest.approx(.01)
+
+
+def test_entropy_coef_persists_in_checkpoint_and_resumes(monkeypatch, tmp_path):
+    import math
+    update, used = scripted_update([{'actor_samples': 4, 'actor_entropy': .3}])
+    _, _, _, saved = run(monkeypatch, tmp_path, ['train', '--total-frames', '60', '--rollout', '2'],
+                         update=update)
+    assert used[0] == .01 and used[1] == pytest.approx(.01*math.exp(.1))
+    assert saved[-1][1]['entropy_coef'] == pytest.approx(.01*math.exp(.1))
+    for name in ('resume', 'legacy'):
+        (tmp_path/name).mkdir()
+    payload = legacy_payload({'entropy_coef': .05})
+    payload['config'].update(reward_version='visual-frontier-v5', stall_timeout_frames=TIMEOUT)
+    update, used = scripted_update([{'actor_samples': 4, 'actor_entropy': .5}])  # At target: unchanged.
+    _, _, _, saved = run(monkeypatch, tmp_path/'resume', ['train', '--total-frames', '60', '--rollout', '2', '--resume'],
+                         payload=payload, update=update)
+    assert used[0] == pytest.approx(.05) and used[1] == pytest.approx(.05)
+    assert saved[-1][1]['entropy_coef'] == pytest.approx(.05)
+    # Older checkpoints without the key start from the base coefficient.
+    update, used = scripted_update([])
+    run(monkeypatch, tmp_path/'legacy', ['train', '--total-frames', '60', '--rollout', '2', '--resume'],
+        payload=legacy_payload({}), update=update)
+    assert used[0] == .01
+
+
+# --- Best checkpoint ---------------------------------------------------------------------------
+
+def wilson_lower_bound(clears, n):
+    import math
+    rate = clears/n
+    return (rate + 1/(2*n) - math.sqrt(rate*(1-rate)/n + 1/(4*n*n))) / (1 + 1/n)
+
+
+def test_best_checkpoint_requires_full_window_and_a_clear(monkeypatch, tmp_path):
+    # No new ground (so no restart snapshots); a death every 10 steps: 45 full-start failures.
+    env, events, _, saved = run(monkeypatch, tmp_path, ['train', '--total-frames', '455', '--rollout', '2'],
+                                death_at=set(range(10, 451, 10)))
+    assert not any(event['event'] == 'best_checkpoint' for event in events)
+    assert all(path == tmp_path/'checkpoints/latest.pt' for path in env.save_paths)
+    state = saved[-1][1]
+    assert state['recent_full_start_clears'] == [0]*40 and state['best_clear_rate'] == -1.
+
+
+def test_best_checkpoint_saved_on_improvement_not_after_decline(monkeypatch, tmp_path):
+    # 38 counted deaths, clear (counted 1), continuation death (not counted), clear (counted 1):
+    # window full with 2 clears. Then 39 more counted deaths push the first clear out (1 clear).
+    deaths = set(range(10, 381, 10)) | {390, 400} | set(range(410, 791, 10))
+    clears = {385, 395}
+    env, events, _, saved = run(monkeypatch, tmp_path, ['train', '--total-frames', '795', '--rollout', '2'],
+                                death_at=deaths, clear_at=clears)
+    best = [event for event in events if event['event'] == 'best_checkpoint']
+    assert best, 'expected a best checkpoint once the window had clears'
+    two = wilson_lower_bound(2, 40)
+    assert all(event['clear_rate'] == pytest.approx(2/40) for event in best)
+    assert all(event['lower_bound'] == pytest.approx(two) for event in best)
+    assert all(event['path'] == str(tmp_path/'checkpoints/best.pt') for event in best)
+    assert best[0]['clears'] == 2 and best[0]['frames'] >= 395
+    # Every best save immediately follows a latest save that already carries the new score.
+    for index, path in enumerate(env.save_paths):
+        if path == tmp_path/'checkpoints/best.pt':
+            assert env.save_paths[index-1] == tmp_path/'checkpoints/latest.pt'
+            assert saved[index-1][1]['best_clear_rate'] == pytest.approx(two)
+            assert saved[index][1]['best_clear_rate'] == pytest.approx(two)
+    assert len(best) > 1  # Ties (same window score) favour the newer policy.
+    assert env.save_paths.count(tmp_path/'checkpoints/best.pt') == len(best)
+    state = saved[-1][1]
+    assert len(state['recent_full_start_clears']) == 40 and sum(state['recent_full_start_clears']) == 1
+    assert wilson_lower_bound(1, 40) < two
+    assert state['best_clear_rate'] == pytest.approx(two)  # Decline never overwrote best.
+    # No best saves once the first clear left the window (score dropped).
+    drop = 410 + 38*10
+    assert best[-1]['frames'] < drop
+
+
+def test_best_path_follows_custom_checkpoint_stem(monkeypatch, tmp_path):
+    custom = tmp_path/'runs-a/policy.pt'
+    env, _, _, _ = run(monkeypatch, tmp_path, ['train', '--total-frames', '398', '--rollout', '100000',
+                                               '--checkpoint', str(custom)],
+                       death_at=set(range(10, 391, 10)), clear_at={395})
+    assert env.save_paths == [custom, tmp_path/'runs-a/policy-best.pt']
+
+
+# --- Checkpoint path resolution ----------------------------------------------------------------
+
+@pytest.mark.parametrize('command', ['play', 'evaluate'])
+@pytest.mark.parametrize('best_exists', [True, False])
+def test_play_and_evaluate_prefer_best_checkpoint(monkeypatch, tmp_path, command, best_exists):
+    latest = existing_checkpoint(tmp_path)
+    best = tmp_path/'checkpoints/best.pt'
+    if best_exists:
+        best.write_bytes(b'best')
+    argv = [command, '--teacher'] + (['--episodes', '1'] if command == 'evaluate' else ['--total-frames', '3'])
+    seen = run_defaults(monkeypatch, tmp_path, argv, legacy_payload({}))
+    assert seen['loads'] == [best if best_exists else latest]
+
+
+@pytest.mark.parametrize('command', ['play', 'evaluate', 'train'])
+def test_explicit_checkpoint_wins_over_best(monkeypatch, tmp_path, command):
+    existing_checkpoint(tmp_path)
+    (tmp_path/'checkpoints/best.pt').write_bytes(b'best')
+    explicit = tmp_path/'mine.pt'
+    explicit.write_bytes(b'mine')
+    extra = {'evaluate': ['--episodes', '1'], 'play': ['--total-frames', '3'],
+             'train': ['--total-frames', '3', '--resume']}[command]
+    seen = run_defaults(monkeypatch, tmp_path, [command, '--teacher', '--checkpoint', str(explicit), *extra],
+                        legacy_payload({}))
+    assert seen['loads'] == [explicit]
+
+
+def test_train_resume_ignores_best_checkpoint(monkeypatch, tmp_path):
+    latest = existing_checkpoint(tmp_path)
+    (tmp_path/'checkpoints/best.pt').write_bytes(b'best')
+    seen = run_defaults(monkeypatch, tmp_path, ['train', '--teacher', '--total-frames', '3', '--resume'],
+                        legacy_payload({}))
+    assert seen['loads'] == [latest]
+
+
+def test_fresh_train_refused_when_only_best_checkpoint_exists(monkeypatch, tmp_path, capsys):
+    (tmp_path/'checkpoints').mkdir()
+    best = tmp_path/'checkpoints/best.pt'
+    best.write_bytes(b'best policy')
+    custom_best = tmp_path/'other/run-best.pt'
+    custom_best.parent.mkdir()
+    custom_best.write_bytes(b'other best')
+    monkeypatch.setattr(cli, 'ROOT', tmp_path)
+    monkeypatch.setattr(cli, 'FrozenEncoder', lambda *args, **kwargs: pytest.fail('Encoder built before guard'))
+    monkeypatch.setattr(cli.checkpoint, 'save', lambda *args: pytest.fail('Checkpoint written'))
+    for argv, existing in [([], best), (['--checkpoint', str(tmp_path/'other/run.pt')], custom_best)]:
+        monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--total-frames', '1', *argv])
+        with pytest.raises(SystemExit) as exit_info:
+            cli.main()
+        assert exit_info.value.code == 2
+        assert str(existing) in capsys.readouterr().err
+    assert best.read_bytes() == b'best policy' and custom_best.read_bytes() == b'other best'
+
+
+def test_fresh_train_refusal_lists_both_existing_files(monkeypatch, tmp_path, capsys):
+    latest = existing_checkpoint(tmp_path)
+    best = tmp_path/'checkpoints/best.pt'
+    best.write_bytes(b'best')
+    monkeypatch.setattr(cli, 'ROOT', tmp_path)
+    monkeypatch.setattr(sys, 'argv', ['mario-agent', 'train', '--teacher', '--total-frames', '1'])
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    err = capsys.readouterr().err
+    assert exit_info.value.code == 2 and str(latest) in err and str(best) in err
+
+
+def test_started_event_logs_restored_entropy_coef(monkeypatch, tmp_path):
+    payload = legacy_payload({'entropy_coef': .037})
+    payload['config'].update(reward_version='visual-frontier-v5', stall_timeout_frames=TIMEOUT)
+    _, events, _, _ = run(monkeypatch, tmp_path, train_argv(1) + ['--resume'], payload=payload)
+    started = next(event for event in events if event['event'] == 'started')
+    assert started['entropy_coef'] == pytest.approx(.037)
+    (tmp_path/'fresh').mkdir()
+    _, events, _, _ = run(monkeypatch, tmp_path/'fresh', train_argv(1))
+    started = next(event for event in events if event['event'] == 'started')
+    assert started['entropy_coef'] == .01
+
+
+# --- ppo.update actor_entropy --------------------------------------------------------------------
+
+def test_ppo_actor_entropy_is_final_policy_entropy_on_actor_samples_only():
+    from torch.distributions import Categorical
+    from mario_embedding_agent.environment import ACTIONS
+    from mario_embedding_agent.policy import ActorCritic
+    from mario_embedding_agent.ppo import Transition, update
+    torch.manual_seed(0)
+    policy = ActorCritic(torch.randn(len(ACTIONS), 768))
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    bias = torch.zeros(len(ACTIONS)); bias[5] = 8.
+    transitions = []
+    for i in range(8):
+        feature = torch.randn(768)
+        action_bias = bias if i % 2 else None
+        action, log_prob, value, _ = policy.act(feature, action_bias=action_bias)
+        transitions.append(Transition(feature, action, log_prob, value, float(i), i == 7, action_bias))
+    metrics = update(policy, optimizer, transitions, 0., epochs=2, minibatch_size=4, target_kl=None)
+    assert metrics['actor_samples'] == 4 and metrics['recovery_samples'] == 4
+    actor = [item for item in transitions if item.action_bias is None]
+    with torch.no_grad():
+        logits, _ = policy(torch.stack([item.features for item in actor]),
+                           action_bias=torch.zeros(len(actor), len(ACTIONS)),
+                           previous_features=torch.zeros(len(actor), 768))
+        expected = float(Categorical(logits=logits).entropy().mean())
+    assert metrics['actor_entropy'] == pytest.approx(expected, rel=1e-5)
+
+
+def test_ppo_actor_entropy_none_for_recovery_only_rollout():
+    from mario_embedding_agent.environment import ACTIONS
+    from mario_embedding_agent.policy import ActorCritic
+    from mario_embedding_agent.ppo import Transition, update
+    policy = ActorCritic(torch.ones(len(ACTIONS), 768))
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    bias = torch.zeros(len(ACTIONS)); bias[5] = 8.
+    transitions = []
+    for i in range(8):
+        feature = torch.randn(768)
+        action, log_prob, value, _ = policy.act(feature, action_bias=bias)
+        transitions.append(Transition(feature, action, log_prob, value, 1., i == 7, bias))
+    metrics = update(policy, optimizer, transitions, 0., epochs=1, minibatch_size=8)
+    assert metrics['actor_samples'] == 0 and metrics['actor_entropy'] is None
+
+
+def test_ppo_actor_entropy_reported_after_kl_early_stop():
+    from torch.distributions import Categorical
+    from mario_embedding_agent.environment import ACTIONS
+    from mario_embedding_agent.policy import ActorCritic
+    from mario_embedding_agent.ppo import Transition, update
+    policy = ActorCritic(torch.ones(len(ACTIONS), 768))
+    optimizer = torch.optim.Adam(policy.parameters(), lr=.001)
+    feature = torch.ones(768)
+    action, log_prob, value, _ = policy.act(feature, sample=False)
+    transitions = [Transition(feature, action, log_prob, value, 1., True) for _ in range(8)]
+    with torch.no_grad():
+        policy.actor.bias[action] += 8.
+        logits, _ = policy(feature)
+    metrics = update(policy, optimizer, transitions, 0., epochs=4, minibatch_size=8, target_kl=.02)
+    assert metrics['stopped_early'] and metrics['optimizer_steps'] == 0
+    # The unchanged policy's true (low) entropy is reported, not a missing/zero minibatch value.
+    assert metrics['actor_entropy'] == pytest.approx(float(Categorical(logits=logits).entropy()), rel=1e-3)
+
+
+def test_kl_early_stop_without_actor_entropy_leaves_coefficient(monkeypatch, tmp_path):
+    # An update that early-stopped and reported only minibatch 'entropy' (or None actor entropy)
+    # must not move the coefficient.
+    update, used = scripted_update([{'actor_samples': 4, 'stopped_early': True, 'entropy': 0.},
+                                    {'actor_samples': 4, 'stopped_early': True, 'actor_entropy': None}])
+    run(monkeypatch, tmp_path, ['train', '--total-frames', '40', '--rollout', '2'], update=update)
+    assert used[:3] == [.01, .01, .01]

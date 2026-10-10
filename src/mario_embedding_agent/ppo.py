@@ -121,6 +121,9 @@ def update(policy, optimizer, transitions, bootstrap_value, *, epochs=2, minibat
         final_logits, predictions = policy(features, action_bias=action_biases, previous_features=previous_features)
         final_log_ratio = Categorical(logits=final_logits).log_prob(actions)-old_logs
         result['final_kl'] = float(((final_log_ratio[actor_mask].exp()-1)-final_log_ratio[actor_mask]).mean()) if actor_mask.any() else 0.0
+        # Policy entropy on actor samples after the update, unaffected by minibatches
+        # without actor samples or an early KL stop.
+        result['actor_entropy'] = float(Categorical(logits=final_logits).entropy()[actor_mask].mean()) if actor_mask.any() else None
         variance = returns.var(unbiased=False)
         result['explained_variance'] = float(1-(returns-predictions).var(unbiased=False)/variance) if variance > 1e-12 else None
     result['mean_learning_reward'] = sum(item.reward for item in transitions)/len(transitions)

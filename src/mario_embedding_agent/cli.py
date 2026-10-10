@@ -3,6 +3,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
 import time
 
@@ -95,11 +96,15 @@ def main():
     parser.add_argument('--rollout', type=int, default=128)
     parser.add_argument('--total-frames', type=int, help='Explicit bounded diagnostic only; otherwise unbounded')
     parser.add_argument('--resume', action='store_true', help='train: continue --checkpoint instead of starting fresh')
-    parser.add_argument('--checkpoint', type=Path, default=ROOT/'checkpoints/latest.pt')
+    parser.add_argument('--checkpoint', type=Path,
+                        help='default: checkpoints/latest.pt; play/evaluate use checkpoints/best.pt when it exists')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--episodes', type=int, default=10,
                         help='Death-ended evaluation attempts before stopping')
     args = parser.parse_args()
+    if args.checkpoint is None:
+        best = ROOT/'checkpoints/best.pt'
+        args.checkpoint = best if args.command in ('play', 'evaluate') and best.exists() else ROOT/'checkpoints/latest.pt'
     if args.fps is None:
         args.fps = 60.0 if args.command == 'play' or args.mode == 'realtime' else 0.0
     args.headless = (args.headless if args.command == 'play' else not args.show)
@@ -111,8 +116,13 @@ def main():
         parser.error('--fps 0 (unthrottled) requires --mode sync; realtime inference would fall behind')
     if args.command == 'evaluate' and (args.episodes <= 0 or args.total_frames is not None):
         parser.error('evaluate requires positive --episodes and stops only at death, not by frame count')
-    if args.command == 'train' and not args.resume and args.checkpoint.exists():
-        parser.error(f'{args.checkpoint} already exists. Continue it with --resume, or move it away to start fresh.')
+    best_path = args.checkpoint.with_name('best.pt' if args.checkpoint.stem == 'latest'
+                                          else f'{args.checkpoint.stem}-best.pt')
+    if args.command == 'train' and not args.resume:
+        existing = [path for path in (args.checkpoint, best_path) if path.exists()]
+        if existing:
+            parser.error(f'{" and ".join(map(str, existing))} already exist(s). Continue with --resume, '
+                         'or move them away to start fresh.')
     if (args.command in ('play', 'evaluate') or args.resume) and not args.checkpoint.exists():
         parser.error(f'{args.checkpoint} does not exist yet. Start training with `mario-agent train`.')
     directory = ROOT/'models/embeddinggemma-2'
@@ -134,7 +144,9 @@ def main():
               'gap_bonus': 1.0, 'gap_detector': 'overworld-rgb-v1',
               'death_penalty': 15.0, 'clear_reward': 50.0, 'pixels_per_reward': 32.0,
               'progress_clip': 5.0, 'reward_version': 'visual-frontier-v5', 'stall_timeout_frames': 1800,
-              'restart_probability': 0.75, 'restart_backoff_px': 192.0, 'restart_snapshot_px': 64.0,
+              'restart_probability': 0.5, 'restart_backoff_px': 192.0, 'restart_snapshot_px': 64.0,
+              'entropy_target': 0.5, 'entropy_coef_max': 0.1, 'entropy_adapt_rate': 0.5,
+              'best_window_attempts': 40,
               'ppo_epochs': 4, 'ppo_minibatch_size': 32, 'target_kl': 0.02, 'value_clip': None,
               'discount_reference_frames': 20, 'optimizer_weight_decay': 0.0,
               'left_action_logit_bias': -3.0, 'entropy_coef': 0.01,
@@ -178,7 +190,8 @@ def main():
             'stagnation_deadband_px', 'recovery_actions', 'recovery_logit_bias',
             'recovery_down_hold_frames', 'recovery_progress_px', 'recovery_progress_window',
             'recovery_progress_events_required', 'recovery_window_net_progress_px', 'stall_timeout_frames',
-            'restart_probability', 'restart_backoff_px', 'restart_snapshot_px')})
+            'restart_probability', 'restart_backoff_px', 'restart_snapshot_px',
+            'entropy_target', 'entropy_coef_max', 'entropy_adapt_rate', 'best_window_attempts')})
         recovery_behavior_migrated |= saved_config.get('pipe_recovery') != config['pipe_recovery']
         saved_config['pipe_recovery'] = config['pipe_recovery']
         saved_config.setdefault('gap_bonus', 1.0)
@@ -215,6 +228,8 @@ def main():
     state = {'frames': 0, 'decisions': 0, 'updates': 0, 'deaths': 0, 'clears': 0,
              'episode_seed': config['seed'], 'episode_commands': [], 'gaps': 0,
              'stalls': 0, 'stall_frames': 0, 'stall_frontier_px': 0.0, 'restarts': 0,
+             'entropy_coef': config['entropy_coef'], 'episode_from_start': True,
+             'recent_full_start_clears': [], 'best_clear_rate': -1.0,
              'stagnant_decisions': 0, 'recovery_active': False, 'recovery_action_index': 0,
              'recovery_progress_window': [], 'previous_features': None}
     if args.command == 'evaluate':
@@ -310,7 +325,29 @@ def main():
 
     def save_checkpoint():
         state.update(visual_position_px=frontier.position, visual_frontier_px=frontier.frontier)
+        # latest.pt is always the newest policy, which can be worse than an earlier one;
+        # also keep the policy with the best level-clear rate over recent full attempts.
+        # Score windows by a Wilson lower bound (z=1) so a lucky 40-attempt streak does
+        # not lock in, require at least one clear, and let ties favour the newer policy.
+        recent = state['recent_full_start_clears']
+        new_best = None
+        if len(recent) >= config['best_window_attempts'] and sum(recent) > 0:
+            n, rate = len(recent), sum(recent)/len(recent)
+            score = (rate + 1/(2*n) - math.sqrt(rate*(1-rate)/n + 1/(4*n*n))) / (1 + 1/n)
+            if score >= state['best_clear_rate']:
+                state['best_clear_rate'] = new_best = score
         checkpoint.save(args.checkpoint, policy, optimizer, config, state)
+        if new_best is not None:
+            checkpoint.save(best_path, policy, optimizer, config, state)
+            emit('best_checkpoint', clear_rate=sum(recent)/len(recent), lower_bound=new_best, path=str(best_path))
+
+    def record_full_attempt(cleared_level):
+        # Only attempts that began at the level start measure whole-level skill;
+        # restarted attempts begin next to the obstacle.
+        if state['episode_from_start']:
+            state['recent_full_start_clears'].append(int(cleared_level))
+            del state['recent_full_start_clears'][:-config['best_window_attempts']]
+        state['episode_from_start'] = False
 
     # Restart curriculum (training only): emulator snapshots taken every few pixels
     # of new ground let a failed episode resume shortly before the place it died, so
@@ -407,7 +444,7 @@ def main():
                 # first update already trains on standardized inputs.
                 policy.update_feature_statistics(rollout_features)
             metrics = update(policy, optimizer, rollout, bootstrap,
-                             entropy_coef=config['entropy_coef'], epochs=config['ppo_epochs'],
+                             entropy_coef=state['entropy_coef'], epochs=config['ppo_epochs'],
                              minibatch_size=config['ppo_minibatch_size'], target_kl=config['target_kl'],
                              reference_frames=config['discount_reference_frames'],
                              value_clip=config['value_clip'])
@@ -416,6 +453,14 @@ def main():
                 policy.update_feature_statistics(rollout_features)
             metrics['update_ms'] = (time.perf_counter()-update_started)*1000
             metrics['feature_count'] = int(getattr(policy, 'feature_count', 0))
+            # Entropy floor: raise the bonus while the policy is more certain than the
+            # target, relax it back toward the base coefficient otherwise. A fixed 0.01 let
+            # entropy fall to ~0.1 nats, after which the policy stopped trying alternatives.
+            metrics['entropy_coef'] = state['entropy_coef']
+            if metrics.get('actor_entropy') is not None:
+                adjusted = state['entropy_coef'] * math.exp(
+                    config['entropy_adapt_rate'] * (config['entropy_target'] - metrics['actor_entropy']))
+                state['entropy_coef'] = min(max(adjusted, config['entropy_coef']), config['entropy_coef_max'])
             rollout.clear()
             state['updates'] += 1
             save_due = True
@@ -434,7 +479,7 @@ def main():
          policy_behavior_migrated=policy_behavior_migrated,
          recovery_behavior_migrated=recovery_behavior_migrated,
          temporal_context=config['temporal_context'], temporal_context_migrated=temporal_context_migrated,
-         left_action_logit_bias=config['left_action_logit_bias'], entropy_coef=config['entropy_coef'],
+         left_action_logit_bias=config['left_action_logit_bias'], entropy_coef=state['entropy_coef'],
          stagnation_threshold=config['stagnation_threshold'], recovery_actions=config['recovery_actions'],
          recovery_logit_bias=config['recovery_logit_bias'],
          recovery_down_hold_frames=config['recovery_down_hold_frames'],
@@ -552,6 +597,7 @@ def main():
                 state['stall_frontier_px'] = 0.0
                 state['previous_features'] = None
                 state[{'death': 'deaths', 'stall': 'stalls', 'clear': 'clears'}[outcome]] += 1
+                record_full_attempt(cleared_level=outcome == 'clear')
                 emit(outcome, raw_reward=last_reward, captured_frame=str(image_path))
                 generation += 1
                 gap_detector = GapDetector()
@@ -612,6 +658,7 @@ def main():
                             gap_detector = deepcopy(snapshot['gap_detector'])
                             next_snapshot_px = snapshot['frontier'] + config['restart_snapshot_px']
                             state['restarts'] += 1
+                            state['episode_from_start'] = False
                             emit('restart', from_frontier_px=snapshot['frontier'], ended_frontier_px=ended_frontier)
                         else:
                             state['episode_seed'] += 1
@@ -622,6 +669,7 @@ def main():
                             detector.observe(frame)
                             episode_snapshots.clear()
                             next_snapshot_px = config['restart_snapshot_px']
+                            state['episode_from_start'] = True
             if stop_evaluation:
                 break
             if args.command == 'train' and save_due:
