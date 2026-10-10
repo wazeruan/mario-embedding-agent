@@ -256,6 +256,13 @@ def main():
                     (state['stagnant_decisions']-config['stagnation_threshold']) %
                     len(config['recovery_actions']))
             torch.set_rng_state(payload['training_state']['torch_rng_state'])
+            if args.command == 'play':
+                # Watch from the level start rather than continuing whatever (possibly
+                # restarted) episode training was in when it saved; keep the counters.
+                state.update(episode_commands=[], previous_features=None, visual_position_px=0.0,
+                             visual_frontier_px=0.0, stall_frames=0, stall_frontier_px=0.0,
+                             stagnant_decisions=0, recovery_active=False, recovery_action_index=0,
+                             recovery_progress_window=[], episode_from_start=True)
     env = make_env()
     frame, _ = env.reset(seed=state['episode_seed'])
     detector = StageDetector()

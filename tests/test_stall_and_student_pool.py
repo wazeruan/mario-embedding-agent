@@ -835,3 +835,47 @@ def test_kl_early_stop_without_actor_entropy_leaves_coefficient(monkeypatch, tmp
                                     {'actor_samples': 4, 'stopped_early': True, 'actor_entropy': None}])
     run(monkeypatch, tmp_path, ['train', '--total-frames', '40', '--rollout', '2'], update=update)
     assert used[:3] == [.01, .01, .01]
+
+
+# --- play starts from the level start --------------------------------------------------------
+
+def in_progress_payload():
+    from mario_embedding_agent.environment import COMMANDS
+    payload = legacy_payload({'episode_commands': [COMMANDS.index(('right',))]*3,
+                              'visual_position_px': 40., 'visual_frontier_px': 50.,
+                              'stall_frames': 300, 'stall_frontier_px': 50., 'stagnant_decisions': 5,
+                              'recovery_active': True, 'recovery_action_index': 2,
+                              'recovery_progress_window': [1., 2.], 'episode_from_start': False,
+                              'previous_features': torch.ones(768), 'clears': 4, 'stalls': 6})
+    payload['config'].update(reward_version='visual-frontier-v5', stall_timeout_frames=TIMEOUT)
+    return payload
+
+
+def test_play_discards_in_progress_episode_but_keeps_counters(monkeypatch, tmp_path):
+    env, events, _, saved = run(monkeypatch, tmp_path, ['play', '--headless', '--fps', '0', '--total-frames', '5'],
+                                payload=in_progress_payload())
+    assert env.steps == 5  # No replay steps before the first decision.
+    assert env.resets == [3]
+    started = next(event for event in events if event['event'] == 'started')
+    assert started['visual_frontier_px'] == 0. and started['visual_position_px'] == 0.
+    assert started['recovery_active'] is False and started['recovery_action_index'] == 0
+    assert started['stagnant_decisions'] == 0
+    assert started['stall_frames'] == 0
+    assert (started['frames'], started['updates'], started['deaths'], started['clears'], started['stalls']) == \
+        (100, 5, 2, 4, 6)
+    first = next(event for event in events if event['event'] == 'decision')
+    # ('started' reports the configured recovery_progress_window size, so check the state here.)
+    assert first['frames'] == 100 and first['recovery_action'] is None
+    assert first['recovery_progress_window'] == []
+    assert saved == []
+
+
+def test_train_resume_still_replays_in_progress_episode(monkeypatch, tmp_path):
+    env, events, _, saved = run(monkeypatch, tmp_path, train_argv(5) + ['--resume'], payload=in_progress_payload())
+    assert env.steps == 3 + 5  # Three replayed commands, then five new frames.
+    started = next(event for event in events if event['event'] == 'started')
+    assert started['visual_frontier_px'] == 50. and started['recovery_active'] is True
+    assert started['stagnant_decisions'] == 5 and started['stall_frames'] == 300
+    first = next(event for event in events if event['event'] == 'decision')
+    assert first['recovery_action'] is not None and first['recovery_progress_window'] == [1., 2.]
+    assert len(saved[-1][1]['episode_commands']) == 3 + 5
