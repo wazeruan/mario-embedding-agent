@@ -32,3 +32,4 @@ dev = [
 mario-agent = "mario_embedding_agent.cli:main"
 
 mario-distill = "mario_embedding_agent.distill:main"
+mario-handwired = "mario_embedding_agent.handwired:main"

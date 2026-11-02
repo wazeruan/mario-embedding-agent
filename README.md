@@ -26,6 +26,27 @@ Options: `--teacher` encodes with EmbeddingGemma-2 itself (~160 ms per frame on 
 
 Each action is a button macro: short jumps hold A for 4 emulator frames and release it for 2; long jumps hold A for 20 and release for 2. While waiting for the next decision, all buttons are released after the macro, so inference cannot accidentally extend a jump.
 
+## Hand-written network (no training)
+
+`src/mario_embedding_agent/handwired.py` is a separate policy whose weights are all set by hand; nothing is trained and the module has no `nn.Parameter`s. It reads the RGB screenshot only:
+
+1. Three 1x1 ReLU conv layers match exact palette colours: `ReLU(1 - L1 distance / 12)` per colour, built from `+(x-c)` and `-(x-c)` units.
+2. 4x4 average pooling gives a 52x64 cell grid. ReLU AND/OR gates and max-pool dilations build the cell maps:
+   - Mario: red and olive near each other.
+   - Pipe: light and dark green in three vertically stacked cells.
+   - Koopa: dark green with white.
+   - Solid: ground, bricks and Goombas, plus pipes and Koopas, followed by a morphological closing.
+   - Pit: sky in the ground rows.
+3. Coincidence convs with a gate weight larger than any window count fire only when "Mario's feet are here AND something is in the window ahead". Separate windows detect low obstacles, tall obstacles and pits; a global max pool turns each into one signal.
+4. A recurrent ReLU circuit holds state: A pressed last frame, frames held, hold limit, and the previous feet map. "Grounded" means the feet are in the same cell as last frame with a floor below; a solid cell stacked above Mario's own cell is a wall, not a floor. The circuit presses A on a fresh take-off for 16 frames (low obstacle) or 22 frames (pipe, wall or pit). It releases A on landing. Right+B is always held.
+
+```sh
+uv run mario-handwired evaluate --episodes 20   # headless; random 0-90 idle frames before each start
+uv run mario-handwired play                     # watch it
+```
+
+The constants were chosen by reading traces of failed runs in the emulator, not by optimisation. On 2026-11-02 it cleared World 1-1 from every start delay of 0 to 90 frames (91/91). The emulator is deterministic, so that delay is the only thing that varies between episodes. The network is fragile to off-policy input: when each frame's command is replaced by a random one with probability 0.02, it cleared 5 of 20 episodes. It is tuned to World 1-1's palette and layout and has not been tried on other levels.
+
 ## Actions and objective
 
 There are 18 actions: idle, walk/run right, walk/run left, down, up, fire, and short/long jumps vertically, right, running right, left, running left. They are button-duration macros, not guaranteed successful maneuvers; jump height also depends on game physics and current movement. The policy applies a −3 logit prior to actions containing left, reducing their baseline softmax mass; frame-conditioned logits can still select left when their evidence overcomes that prior. Training starts with an entropy coefficient of 0.01 and adapts it (see Entropy floor).
